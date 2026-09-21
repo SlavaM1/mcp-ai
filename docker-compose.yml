@@ -1,0 +1,79 @@
+services:
+  db:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mcp_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-mcp_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mcp_ai_local}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://mcp_ai:mcp_ai_local@db:5432/mcp_ai}
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-https://mcp.deepwiki.com/mcp}
+      MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4201}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      target: runtime
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "${FRONTEND_PORT:-4201}:80"
+    restart: unless-stopped
+
+  backend-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: test
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://mcp_ai:mcp_ai_local@db:5432/mcp_ai}
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-https://mcp.deepwiki.com/mcp}
+      MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    name: mcp-ai-postgres-data

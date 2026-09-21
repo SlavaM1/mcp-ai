@@ -1,0 +1,162 @@
+<div class="app-shell">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="MCP AI — на главную">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>MCP AI</span>
+    </a>
+
+    <div class="server-strip" [class.server-strip-online]="status()?.connected">
+      <span class="status-light" aria-hidden="true"></span>
+      <div>
+        <strong>
+          @if (statusLoading()) { Проверяем MCP } @else if (status()?.connected) { MCP подключён } @else { MCP недоступен }
+        </strong>
+        <small>{{ status()?.server_url ?? 'MCP_SERVER_URL' }}</small>
+      </div>
+      @if (status()?.tool_count !== null && status()?.tool_count !== undefined) {
+        <span class="tool-count">{{ status()?.tool_count }} tools</span>
+      }
+    </div>
+
+    <button class="refresh-button" type="button" (click)="refreshStatus()" [disabled]="statusLoading()">
+      {{ statusLoading() ? 'Проверка…' : 'Проверить связь' }}
+    </button>
+  </header>
+
+  <div class="workspace" [class.workspace-collapsed]="sidebarCollapsed()">
+    <aside class="sidebar" [class.sidebar-collapsed]="sidebarCollapsed()">
+      <button
+        class="sidebar-toggle"
+        type="button"
+        (click)="toggleSidebar()"
+        [attr.aria-label]="sidebarCollapsed() ? 'Развернуть историю' : 'Свернуть историю'"
+      >
+        {{ sidebarCollapsed() ? '›' : '‹' }}
+      </button>
+
+      @if (!sidebarCollapsed()) {
+        <div class="sidebar-heading">
+          <div><span>MCP conversations</span><h2>Ваши чаты</h2></div>
+          <b>{{ sessions().length }}</b>
+        </div>
+        <button class="new-chat" type="button" (click)="createSession()" [disabled]="pending()">
+          <span>+</span> Новый чат
+        </button>
+
+        <nav class="history" aria-label="Сохранённые чат-сессии">
+          @if (loadingSessions() && sessions().length === 0) {
+            <p class="history-empty">Загружаем сохранённые сессии…</p>
+          } @else if (sessions().length === 0) {
+            <p class="history-empty">Создайте чат. Он останется здесь после перезапуска.</p>
+          } @else {
+            @for (session of sessions(); track session.id) {
+              <button
+                type="button"
+                [class.history-active]="activeSession()?.id === session.id"
+                (click)="selectSession(session.id)"
+                [disabled]="pending()"
+              >
+                <strong>{{ session.title }}</strong>
+                <small>{{ session.message_count }} сообщ. · {{ session.updated_at | date: 'dd.MM, HH:mm' }}</small>
+              </button>
+            }
+          }
+        </nav>
+      }
+    </aside>
+
+    <div class="chat-column">
+      <main class="chat" aria-live="polite">
+        @if (!activeSession() || activeSession()?.messages?.length === 0) {
+          <section class="welcome">
+            <div class="protocol-map" aria-hidden="true">
+              <span>UI</span><i></i><span>API</span><i></i><span>MCP</span>
+            </div>
+            <p class="eyebrow">Streamable HTTP · tools/list</p>
+            <h1>Посмотрите, что умеет MCP-сервер</h1>
+            <p>
+              Запрос проходит через официальный Python SDK. Ответ сохраняется вместе с JSON Schema
+              каждого инструмента, но сами инструменты не запускаются.
+            </p>
+            @if (!activeSession()) {
+              <button class="welcome-action" type="button" (click)="createSession()" [disabled]="pending()">
+                Создать первую сессию
+              </button>
+            }
+          </section>
+        } @else {
+          <section class="message-list" aria-label="История сообщений">
+            @for (message of activeSession()?.messages ?? []; track message.id) {
+              <article class="message" [class.message-user]="message.role === 'user'">
+                <div class="avatar">{{ message.role === 'user' ? 'В' : 'M' }}</div>
+                <div class="message-body">
+                  <div class="message-heading">
+                    <strong>{{ message.role === 'user' ? 'Вы' : 'MCP AI' }}</strong>
+                    <time>{{ message.created_at | date: 'HH:mm' }}</time>
+                  </div>
+                  <p>{{ message.content }}</p>
+
+                  @if (toolsFor(message).length > 0) {
+                    <div class="tools-summary">
+                      <span>Ответ tools/list</span>
+                      <strong>{{ toolsFor(message).length }} инструмента</strong>
+                      <small>{{ message.mcp_data?.server_url }}</small>
+                    </div>
+                    <div class="tool-list">
+                      @for (tool of toolsFor(message); track tool.name) {
+                        <article class="tool-card">
+                          <div class="tool-card-heading">
+                            <span class="tool-glyph" aria-hidden="true">JSON</span>
+                            <h3>{{ tool.name }}</h3>
+                          </div>
+                          <p>{{ tool.description || 'Описание не предоставлено сервером.' }}</p>
+                          <details>
+                            <summary>Входная JSON Schema</summary>
+                            <pre>{{ tool.input_schema | json }}</pre>
+                          </details>
+                        </article>
+                      }
+                    </div>
+                  }
+
+                  @if (message.mcp_data?.status === 'error') {
+                    <div class="inline-error">{{ message.mcp_data?.error }}</div>
+                  }
+                </div>
+              </article>
+            }
+          </section>
+        }
+
+        @if (error()) {
+          <div class="error-card" role="alert">
+            <span>!</span><p>{{ error() }}</p>
+            <button type="button" (click)="dismissError()" aria-label="Закрыть сообщение">×</button>
+          </div>
+        }
+      </main>
+
+      <footer class="composer-wrap">
+        <div class="composer">
+          <textarea
+            #composerInput
+            [(ngModel)]="draft"
+            (keydown)="handleKeydown($event)"
+            [disabled]="pending()"
+            rows="1"
+            maxlength="2000"
+            aria-label="Текст запроса списка инструментов"
+          ></textarea>
+          <button
+            type="button"
+            (click)="requestTools()"
+            [disabled]="pending() || !draft.trim()"
+          >
+            {{ pending() ? 'Запрос…' : 'Получить список MCP-инструментов' }}
+          </button>
+        </div>
+        <p>Выполняется только стандартный MCP-метод <code>tools/list</code>. Инструменты и LLM не вызываются.</p>
+      </footer>
+    </div>
+  </div>
+</div>
