@@ -45,13 +45,17 @@ km/h.
 
 ## Configuration
 
-Create `.env` from `.env.example` and provide an OpenAI-compatible provider:
+Create `.env` from `.env.example` and provide an OpenAI-compatible provider. For DeepSeek:
 
 ```dotenv
 LLM_API_KEY=replace-with-your-key
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
 ```
+
+Select the model through `LLM_MODEL`. DeepSeek exposes `deepseek-chat` and
+`deepseek-reasoner`; `deepseek-chat` is recommended for this agent's tool-calling flow. Recreate the
+backend container after changing the value.
 
 The key is never included in source, images, or committed Compose configuration. If any required LLM
 value is absent, `/health` reports `"llm":"not_configured"` and chat requests return a clear `503`
