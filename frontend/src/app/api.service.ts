@@ -8,6 +8,15 @@ export interface MCPTool {
   input_schema: Record<string, unknown> | null;
 }
 
+export interface MCPToolCall {
+  id: string;
+  name: string;
+  arguments: unknown;
+  result?: unknown;
+  error?: string | null;
+  duration_ms?: number | null;
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;
@@ -18,6 +27,7 @@ export interface ChatMessage {
     server_url?: string;
     error?: string;
     tools?: MCPTool[];
+    tool_calls?: MCPToolCall[];
   } | null;
   created_at: string;
 }
@@ -41,11 +51,10 @@ export interface MCPStatus {
   error: string | null;
 }
 
-interface ToolListResponse {
+interface AgentMessageResponse {
   session: ChatSession;
-  tools: MCPTool[];
   server_url: string;
-  connected: boolean;
+  tool_calls: MCPToolCall[];
 }
 
 @Injectable({ providedIn: 'root' })
@@ -66,9 +75,9 @@ export class ApiService {
     );
   }
 
-  listTools(sessionId: string, message: string): Promise<ToolListResponse> {
+  sendMessage(sessionId: string, message: string): Promise<AgentMessageResponse> {
     return firstValueFrom(
-      this.http.post<ToolListResponse>(`/api/sessions/${sessionId}/tools/list`, { message }),
+      this.http.post<AgentMessageResponse>(`/api/sessions/${sessionId}/messages`, { message }),
     );
   }
 

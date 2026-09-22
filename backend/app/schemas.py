@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class SessionCreate(BaseModel):
@@ -36,6 +36,13 @@ class ToolListRequest(BaseModel):
     message: str = Field(default="Получить список MCP-инструментов", min_length=1, max_length=2000)
 
 
+class AgentMessageRequest(BaseModel):
+    message: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=2000),
+    ]
+
+
 class ToolDefinition(BaseModel):
     name: str
     description: str | None = None
@@ -54,3 +61,9 @@ class MCPStatus(BaseModel):
     server_url: str
     tool_count: int | None = None
     error: str | None = None
+
+
+class AgentMessageResponse(BaseModel):
+    session: SessionRead
+    server_url: str
+    tool_calls: list[dict[str, Any]]

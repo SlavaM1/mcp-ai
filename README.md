@@ -1,86 +1,74 @@
 # mcp-ai
 
-`mcp-ai` is a small persisted chat client that discovers tools exposed by a remote Model Context
-Protocol server. The current stage connects to a public MCP endpoint with the official Python SDK,
-executes only `tools/list`, renders each tool and its input JSON Schema, and stores the complete
-user/assistant exchange in PostgreSQL.
-
-The UI follows the visual structure of the local `web_llm` project: a compact connection header,
-saved chat history, a central message stream, and a fixed composer. It is implemented independently
-and does not include files, secrets, build output, or Git metadata from the reference project.
-
-## Current scope
-
-- Gets the MCP tool list through the official `mcp` Python package.
-- Does **not** execute any MCP tool.
-- Does **not** use an LLM or generate model responses.
-- Stores chat sessions, user requests, assistant responses, server metadata, and tool schemas.
+Persisted Angular chat with a Python agent that discovers and invokes tools through Model Context
+Protocol. The bundled MCP server resolves a city through Open-Meteo Geocoding, reads current weather
+from Open-Meteo Forecast, and returns a structured result. The LLM uses OpenAI-compatible chat
+completions with function calling.
 
 ## Architecture
 
 ```text
 Browser
   -> nginx / Angular 20
-  -> /api reverse proxy
-  -> FastAPI
-      -> official MCP ClientSession -> DeepWiki Streamable HTTP
-      -> SQLAlchemy -> PostgreSQL 17
+  -> FastAPI agent
+       -> OpenAI-compatible LLM
+       -> MCP ClientSession -> weather-mcp -> Open-Meteo
+       -> SQLAlchemy -> PostgreSQL 17
 ```
 
-The backend opens a request-scoped Streamable HTTP connection, initializes an MCP `ClientSession`,
-calls `list_tools()`, and normalizes the SDK models into JSON. A successful user request and its
-assistant response are committed in one database transaction. On an MCP error, a readable assistant
-error is also persisted before the API returns `502` or `504`.
+For every chat turn the backend loads session history, opens an MCP Streamable HTTP session, calls
+`list_tools()`, converts the returned names, descriptions, and `inputSchema` values to LLM tools, and
+lets the model decide whether to call one. Only names returned by that MCP session can be invoked.
+Tool calls are limited by `MAX_TOOL_CALLS`; the final natural-language response and technical MCP
+payload are stored together in PostgreSQL.
 
-## Public MCP server
+The legacy `POST /api/sessions/{id}/tools/list` endpoint remains available for direct tool discovery
+and existing saved payloads continue to render in the UI.
 
-The default is the official public DeepWiki endpoint:
+## Services
 
-```text
-https://mcp.deepwiki.com/mcp
-```
-
-DeepWiki documents this endpoint as free, no-auth, and Streamable HTTP. It exposes tools for reading
-and querying documentation for public GitHub repositories. The endpoint can be replaced using
-`MCP_SERVER_URL` without changing code. External availability and rate limits are controlled by the
-provider and have no project SLA.
-
-## Containers
-
-| Service | Purpose | Published port |
+| Service | Purpose | Host port |
 | --- | --- | --- |
-| `frontend` | production Angular build served by nginx; proxies `/api` | `4201` |
-| `backend` | FastAPI, MCP client, SQLAlchemy; runs Alembic on startup | `8000` |
+| `frontend` | Production Angular build served by nginx | `4201` |
+| `backend` | FastAPI agent, MCP client, persistence, Alembic | `8000` |
+| `weather-mcp` | MCP 2.2 Streamable HTTP server and Open-Meteo client | `8001` |
 | `db` | PostgreSQL 17 | internal only |
-| `backend-test` | optional test image with pytest | none |
+| `backend-test` | Optional pytest image | none |
 
-PostgreSQL data is kept in the named volume `mcp-ai-postgres-data`. Never use
-`docker compose down -v` unless permanent data deletion is intended.
+Internal MCP endpoint: `http://weather-mcp:8001/mcp`.
 
-## Database
+Published MCP endpoint: `http://localhost:8001/mcp`.
 
-Alembic owns the schema; the application never calls `create_all()`.
-
-- `chat_sessions`: UUID, title, creation time, update time.
-- `chat_messages`: UUID, session UUID, constrained role (`user`, `assistant`, `system`), content,
-  optional JSONB MCP payload, creation time.
-- `chat_messages.session_id` uses `ON DELETE CASCADE` and is indexed.
+Registered tool: `get_current_weather`, with one required, trimmed, non-empty `city` string of at
+most 100 characters. Temperatures are Celsius, relative humidity is percent, and wind speed is
+km/h.
 
 ## Configuration
 
-All versions are pinned in `backend/requirements*.txt`, `frontend/package.json`, and the Dockerfiles.
-Copying `.env.example` to `.env` is optional because Compose has the same safe local defaults.
+Create `.env` from `.env.example` and provide an OpenAI-compatible provider:
+
+```dotenv
+LLM_API_KEY=replace-with-your-key
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+```
+
+The key is never included in source, images, or committed Compose configuration. If any required LLM
+value is absent, `/health` reports `"llm":"not_configured"` and chat requests return a clear `503`
+diagnostic instead of reporting an MCP failure.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MCP_SERVER_URL` | `https://mcp.deepwiki.com/mcp` | remote Streamable HTTP endpoint |
-| `MCP_TIMEOUT_SECONDS` | `30` | MCP HTTP and response timeout |
-| `DATABASE_URL` | Compose PostgreSQL URL | SQLAlchemy connection URL |
-| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | local development values | database bootstrap |
-| `CORS_ORIGINS` | `http://localhost:4201` | direct backend CORS origin list |
-| `FRONTEND_PORT`, `BACKEND_PORT` | `4201`, `8000` | host ports |
-
-Do not commit `.env`; it is ignored by Git and Docker build context.
+| `LLM_API_KEY` | none | OpenAI-compatible API credential |
+| `LLM_BASE_URL` | none | API root containing `/chat/completions` |
+| `LLM_MODEL` | none | Tool-calling model name |
+| `LLM_TIMEOUT_SECONDS` | `60` | Timeout for one LLM request |
+| `MAX_TOOL_CALLS` | `4` | Maximum MCP calls in one chat turn |
+| `MCP_SERVER_URL` | `http://weather-mcp:8001/mcp` | Streamable HTTP endpoint |
+| `MCP_TIMEOUT_SECONDS` | `30` | MCP timeout |
+| `DATABASE_URL` | Compose PostgreSQL URL | SQLAlchemy URL |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | environment/default | Standard proxy settings |
+| `FRONTEND_PORT`, `BACKEND_PORT`, `WEATHER_MCP_PORT` | `4201`, `8000`, `8001` | Published ports |
 
 ## Run
 
@@ -93,80 +81,61 @@ Open:
 
 - UI: <http://localhost:4201>
 - Backend OpenAPI: <http://localhost:8000/docs>
-- Backend readiness: <http://localhost:8000/health>
+- Backend health: <http://localhost:8000/health>
+- Weather MCP health: <http://localhost:8001/health>
 
-Stop without deleting PostgreSQL data:
+PostgreSQL data is stored in the named volume `mcp-ai-postgres-data`. Stop without removing it:
 
 ```bash
 docker compose down
 ```
 
-## Tests
+Do not use `docker compose down -v` unless permanent deletion is intended.
 
-Run backend tests in Docker against PostgreSQL:
+## API
 
-```bash
-docker compose --profile test run --build --rm backend-test
-```
-
-The small test suite verifies MCP connection/session use and result normalization, connection error
-translation, session creation, atomic storage of a user request plus tool response, and retrieval of
-the stored history. The real external endpoint is intentionally mocked in automated tests.
-
-Build the production frontend separately if needed:
-
-```bash
-docker compose build frontend
-```
-
-## API examples
-
-Create a chat session:
+Create a session and send a natural-language message:
 
 ```bash
 curl -sS -X POST http://localhost:8000/api/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"title":"DeepWiki tools"}'
-```
+  -d '{"title":"Погода"}'
 
-List sessions and load one history:
-
-```bash
-curl -sS http://localhost:8000/api/sessions
-curl -sS http://localhost:8000/api/sessions/SESSION_UUID
-```
-
-Perform and persist a real `tools/list` exchange:
-
-```bash
-curl -sS -X POST http://localhost:8000/api/sessions/SESSION_UUID/tools/list \
+curl -sS -X POST http://localhost:8000/api/sessions/SESSION_UUID/messages \
   -H 'Content-Type: application/json' \
-  -d '{"message":"Получить список MCP-инструментов"}'
+  -d '{"message":"Какая сейчас погода в Новосибирске?"}'
 ```
 
-Check MCP separately from backend readiness:
+Other endpoints:
+
+- `GET /api/sessions` and `GET /api/sessions/{id}`: saved sessions and history.
+- `GET /api/mcp/status`: live MCP connectivity and tool count.
+- `POST /api/sessions/{id}/tools/list`: direct discovery retained from Day 16.
+
+## Tests
 
 ```bash
-curl -sS http://localhost:8000/api/mcp/status
+docker compose --profile test run --build --rm backend-test
+docker compose run --build --rm \
+  -v "$PWD/weather-mcp/tests:/app/tests:ro" \
+  weather-mcp python -m unittest discover -s tests
+docker compose build frontend
 ```
 
-Temporary MCP failure does not fail `/health`; it is reported by `/api/mcp/status` and the tool-list
-action. Database failures make `/health` return `503`.
+Automated tests cover MCP normalization and errors, agent-selected and ordinary no-tool turns,
+rejection of unadvertised tools, database persistence, Open-Meteo parsing and error categories, and
+the generated MCP schema. Final Open-Meteo verification should use the running containers without
+mocks.
 
-## Persistence check
+## Persistence
 
-1. Create a session and request tools through the UI or API.
-2. Record the session UUID and retrieve its history.
-3. Run `docker compose restart`.
-4. Wait for healthy services and request the same session again.
-5. The same messages and JSONB tool payload must remain available.
+Alembic owns the existing `chat_sessions` and `chat_messages` schema. No Day 17 migration is needed:
+tool name, arguments, result/error, duration, server URL, and discovered tools fit the existing JSONB
+`mcp_data` field. The named PostgreSQL volume preserves sessions across rebuilds and restarts.
 
-The volume also survives `docker compose down` followed by `docker compose up -d`. Do not add `-v`.
+## Limitations
 
-## Known limitations
-
-- Only `tools/list` is supported; pagination is not needed by the current DeepWiki response.
-- MCP tools are displayed but cannot be invoked.
-- There is no LLM, authentication, multi-user isolation, chat deletion, or server selector in the UI.
-- The MCP connection is request-scoped rather than pooled.
-- DeepWiki only works with public repositories and is an external dependency.
+- A configured external OpenAI-compatible model with tool-calling support is required for chat.
+- Open-Meteo and the configured LLM are external dependencies without a project SLA.
+- Authentication and multi-user isolation are not implemented.
+- MCP and LLM connections are request-scoped; requests are not queued or streamed to the UI.

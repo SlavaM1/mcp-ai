@@ -70,13 +70,13 @@
         @if (!activeSession() || activeSession()?.messages?.length === 0) {
           <section class="welcome">
             <div class="protocol-map" aria-hidden="true">
-              <span>UI</span><i></i><span>API</span><i></i><span>MCP</span>
+              <span>UI</span><i></i><span>API</span><i></i><span>LLM</span><i></i><span>MCP</span>
             </div>
-            <p class="eyebrow">Streamable HTTP · tools/list</p>
-            <h1>Посмотрите, что умеет MCP-сервер</h1>
+            <p class="eyebrow">AI-агент · динамический выбор инструментов</p>
+            <h1>Спросите агента на естественном языке</h1>
             <p>
-              Запрос проходит через официальный Python SDK. Ответ сохраняется вместе с JSON Schema
-              каждого инструмента, но сами инструменты не запускаются.
+              LLM определит, какие MCP-инструменты нужны для ответа, вызовет их и сформулирует
+              итоговый ответ. Технические детали вызовов останутся рядом с сообщением.
             </p>
             @if (!activeSession()) {
               <button class="welcome-action" type="button" (click)="createSession()" [disabled]="pending()">
@@ -95,6 +95,46 @@
                     <time>{{ message.created_at | date: 'HH:mm' }}</time>
                   </div>
                   <p>{{ message.content }}</p>
+
+                  @if (toolCallsFor(message).length > 0) {
+                    <section class="tool-calls" aria-label="Технические детали вызовов MCP">
+                      <div class="tool-calls-summary">
+                        <span>Вызовы MCP</span>
+                        <strong>{{ toolCallsFor(message).length }}</strong>
+                        <small>{{ message.mcp_data?.server_url }}</small>
+                      </div>
+                      <div class="tool-call-list">
+                        @for (call of toolCallsFor(message); track call.id) {
+                          <article class="tool-call-card" [class.tool-call-failed]="call.error">
+                            <div class="tool-call-heading">
+                              <span class="tool-glyph" aria-hidden="true">CALL</span>
+                              <h3>{{ call.name }}</h3>
+                              @if (call.duration_ms !== null && call.duration_ms !== undefined) {
+                                <time>{{ call.duration_ms }} ms</time>
+                              }
+                            </div>
+                            <div class="tool-call-data">
+                              <div>
+                                <span>Аргументы</span>
+                                <pre>{{ call.arguments | json }}</pre>
+                              </div>
+                              @if (call.error) {
+                                <div class="tool-call-error">
+                                  <span>Ошибка</span>
+                                  <p>{{ call.error }}</p>
+                                </div>
+                              } @else {
+                                <div>
+                                  <span>Результат</span>
+                                  <pre>{{ call.result | json }}</pre>
+                                </div>
+                              }
+                            </div>
+                          </article>
+                        }
+                      </div>
+                    </section>
+                  }
 
                   @if (toolsFor(message).length > 0) {
                     <div class="tools-summary">
@@ -145,17 +185,18 @@
             [disabled]="pending()"
             rows="1"
             maxlength="2000"
-            aria-label="Текст запроса списка инструментов"
+            placeholder="Задайте вопрос агенту"
+            aria-label="Сообщение AI-агенту"
           ></textarea>
           <button
             type="button"
-            (click)="requestTools()"
+            (click)="sendMessage()"
             [disabled]="pending() || !draft.trim()"
           >
-            {{ pending() ? 'Запрос…' : 'Получить список MCP-инструментов' }}
+            {{ pending() ? 'Отправка…' : 'Отправить' }}
           </button>
         </div>
-        <p>Выполняется только стандартный MCP-метод <code>tools/list</code>. Инструменты и LLM не вызываются.</p>
+        <p>LLM анализирует вопрос и сам выбирает подходящие MCP-инструменты.</p>
       </footer>
     </div>
   </div>

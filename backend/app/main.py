@@ -7,8 +7,10 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
+from .agent import AgentExecutionError, ChatAgent
 from .config import get_settings
 from .database import get_db
+from .llm_client import OpenAICompatibleClient
 from .mcp_client import (
     MCPClientError,
     MCPInvalidResponseError,
@@ -17,6 +19,8 @@ from .mcp_client import (
 )
 from .models import ChatMessage, ChatSession, MessageRole
 from .schemas import (
+    AgentMessageRequest,
+    AgentMessageResponse,
     MCPStatus,
     MessageRead,
     SessionCreate,
@@ -40,6 +44,15 @@ app.add_middleware(
 
 def get_mcp_client() -> MCPToolsClient:
     return MCPToolsClient(settings.mcp_server_url, settings.mcp_timeout_seconds)
+
+
+def get_llm_client() -> OpenAICompatibleClient:
+    return OpenAICompatibleClient(
+        settings.llm_api_key,
+        settings.llm_base_url,
+        settings.llm_model,
+        settings.llm_timeout_seconds,
+    )
 
 
 def _session_query(session_id: uuid.UUID):
@@ -107,7 +120,12 @@ def health(db: Session = Depends(get_db)) -> dict[str, str]:
     except SQLAlchemyError as exc:
         logger.exception("Database healthcheck failed")
         raise HTTPException(status_code=503, detail="База данных недоступна.") from exc
-    return {"status": "ok", "database": "connected"}
+    llm_configured = all((settings.llm_api_key, settings.llm_base_url, settings.llm_model))
+    return {
+        "status": "ok",
+        "database": "connected",
+        "llm": "configured" if llm_configured else "not_configured",
+    }
 
 
 @app.post("/api/sessions", response_model=SessionRead, status_code=201)
@@ -162,6 +180,61 @@ async def mcp_status(client: MCPToolsClient = Depends(get_mcp_client)) -> MCPSta
         )
     except MCPClientError as exc:
         return MCPStatus(connected=False, server_url=client.server_url, error=str(exc))
+
+
+@app.post("/api/sessions/{session_id}/messages", response_model=AgentMessageResponse)
+async def send_agent_message(
+    session_id: uuid.UUID,
+    payload: AgentMessageRequest,
+    db: Session = Depends(get_db),
+    mcp_client: MCPToolsClient = Depends(get_mcp_client),
+    llm_client: OpenAICompatibleClient = Depends(get_llm_client),
+) -> AgentMessageResponse:
+    chat_session = _load_session(db, session_id)
+    user_content = payload.message.strip()
+    agent = ChatAgent(mcp_client, llm_client, settings.max_tool_calls)
+    db.commit()
+    try:
+        result = await agent.run(chat_session.messages, user_content)
+    except AgentExecutionError as exc:
+        mcp_data = {
+            "status": "error",
+            "server_url": mcp_client.server_url,
+            "error": str(exc),
+            "error_category": exc.category,
+            "available_tools": exc.tools,
+            "tool_calls": exc.tool_calls,
+        }
+        _save_exchange(db, chat_session, user_content, str(exc), mcp_data)
+        response_status = {
+            "llm_configuration": status.HTTP_503_SERVICE_UNAVAILABLE,
+            "mcp_timeout": status.HTTP_504_GATEWAY_TIMEOUT,
+            "mcp_unavailable": status.HTTP_502_BAD_GATEWAY,
+            "llm_unavailable": status.HTTP_502_BAD_GATEWAY,
+            "llm_invalid_response": status.HTTP_502_BAD_GATEWAY,
+            "tool_limit": status.HTTP_502_BAD_GATEWAY,
+        }.get(exc.category, status.HTTP_502_BAD_GATEWAY)
+        raise HTTPException(status_code=response_status, detail=str(exc)) from exc
+
+    has_tool_error = any(call.get("error") for call in result.tool_calls)
+    mcp_data = {
+        "status": "tool_error" if has_tool_error else "ok",
+        "server_url": mcp_client.server_url,
+        "available_tools": result.tools,
+        "tool_calls": result.tool_calls,
+    }
+    saved_session = _save_exchange(
+        db,
+        chat_session,
+        user_content,
+        result.content,
+        mcp_data,
+    )
+    return AgentMessageResponse(
+        session=_session_read(saved_session),
+        server_url=mcp_client.server_url,
+        tool_calls=result.tool_calls,
+    )
 
 
 @app.post("/api/sessions/{session_id}/tools/list", response_model=ToolListResponse)

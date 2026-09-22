@@ -52,3 +52,28 @@ async def test_connection_error_is_translated():
 
     with pytest.raises(MCPConnectionError, match="Не удалось подключиться"):
         await client.list_tools()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_is_normalized():
+    class FakeSession:
+        async def call_tool(self, name, arguments):
+            assert (name, arguments) == ("get_current_weather", {"city": "Омск"})
+            return SimpleNamespace(
+                model_dump=lambda **_kwargs: {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "structuredContent": {"temperature": 10},
+                    "isError": False,
+                }
+            )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield FakeSession()
+
+    result = await MCPToolsClient("https://example.test/mcp", session_factory=fake_session).call_tool(
+        "get_current_weather", {"city": "Омск"}
+    )
+
+    assert result["is_error"] is False
+    assert result["structured_content"] == {"temperature": 10}

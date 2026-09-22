@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
@@ -7,6 +8,11 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
+
+from .logging_utils import log_event
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class MCPClientError(Exception):
@@ -27,6 +33,8 @@ class MCPInvalidResponseError(MCPClientError):
 
 class ToolSession(Protocol):
     async def list_tools(self) -> Any: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
 
 SessionFactory = Callable[[], Any]
@@ -58,29 +66,32 @@ class MCPToolsClient:
                     await session.initialize()
                     yield session
 
-    async def list_tools(self) -> list[dict[str, Any]]:
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator["ConnectedMCPTools"]:
         factory = self._session_factory or self._open_session
+        log_event(logger, logging.INFO, "mcp_connecting", server_url=self.server_url)
         try:
-            async with factory() as session:
-                result = await session.list_tools()
-            if not hasattr(result, "tools"):
-                raise MCPInvalidResponseError("MCP-сервер вернул ответ без списка tools.")
-            return [self._normalize_tool(tool) for tool in result.tools]
-        except MCPClientError:
-            raise
-        except (TimeoutError, httpx2.TimeoutException) as exc:
-            raise MCPTimeoutError("MCP-сервер не ответил за отведённое время.") from exc
-        except ValidationError as exc:
-            raise MCPInvalidResponseError("MCP-сервер вернул некорректный ответ.") from exc
-        except MCPError as exc:
-            message = str(exc)
-            if "timed out" in message.lower() or "timeout" in message.lower():
-                raise MCPTimeoutError("MCP-сервер не ответил за отведённое время.") from exc
-            raise MCPConnectionError(f"Ошибка MCP-протокола: {message}") from exc
+            manager = factory()
+            session = await manager.__aenter__()
         except Exception as exc:
-            if self._contains_timeout(exc):
-                raise MCPTimeoutError("MCP-сервер не ответил за отведённое время.") from exc
-            raise MCPConnectionError("Не удалось подключиться к MCP-серверу.") from exc
+            self._raise_translated(exc)
+
+        log_event(logger, logging.INFO, "mcp_connected", server_url=self.server_url)
+        try:
+            yield ConnectedMCPTools(session)
+        finally:
+            try:
+                await manager.__aexit__(None, None, None)
+            except Exception as exc:
+                self._raise_translated(exc)
+
+    async def list_tools(self) -> list[dict[str, Any]]:
+        async with self.connect() as session:
+            return await session.list_tools()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        async with self.connect() as session:
+            return await session.call_tool(name, arguments)
 
     @staticmethod
     def _normalize_tool(tool: Any) -> dict[str, Any]:
@@ -111,3 +122,48 @@ class MCPToolsClient:
         if isinstance(exc, BaseExceptionGroup):
             return any(MCPToolsClient._contains_timeout(item) for item in exc.exceptions)
         return False
+
+    @staticmethod
+    def _raise_translated(exc: Exception) -> None:
+        if isinstance(exc, MCPClientError):
+            raise exc
+        if MCPToolsClient._contains_timeout(exc):
+            raise MCPTimeoutError("MCP-сервер не ответил за отведённое время.") from exc
+        if isinstance(exc, ValidationError):
+            raise MCPInvalidResponseError("MCP-сервер вернул некорректный ответ.") from exc
+        if isinstance(exc, MCPError):
+            message = str(exc)
+            raise MCPConnectionError(f"Ошибка MCP-протокола: {message}") from exc
+        raise MCPConnectionError("Не удалось подключиться к MCP-серверу.") from exc
+
+
+class ConnectedMCPTools:
+    def __init__(self, session: ToolSession) -> None:
+        self._session = session
+
+    async def list_tools(self) -> list[dict[str, Any]]:
+        try:
+            result = await self._session.list_tools()
+        except Exception as exc:
+            MCPToolsClient._raise_translated(exc)
+        if not hasattr(result, "tools"):
+            raise MCPInvalidResponseError("MCP-сервер вернул ответ без списка tools.")
+        tools = [MCPToolsClient._normalize_tool(tool) for tool in result.tools]
+        log_event(logger, logging.INFO, "mcp_tools_listed", tool_count=len(tools))
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = await self._session.call_tool(name, arguments)
+        except Exception as exc:
+            MCPToolsClient._raise_translated(exc)
+        raw = result.model_dump(mode="json", by_alias=True) if hasattr(result, "model_dump") else result
+        if not isinstance(raw, dict):
+            raise MCPInvalidResponseError("MCP-сервер вернул неизвестный формат результата.")
+        if not isinstance(raw.get("content"), list):
+            raise MCPInvalidResponseError("MCP-сервер вернул некорректный результат инструмента.")
+        return {
+            "is_error": bool(raw.get("isError", raw.get("is_error", False))),
+            "content": raw.get("content", []),
+            "structured_content": raw.get("structuredContent", raw.get("structured_content")),
+        }

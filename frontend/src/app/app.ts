@@ -9,6 +9,7 @@ import {
   ChatSessionSummary,
   MCPStatus,
   MCPTool,
+  MCPToolCall,
 } from './api.service';
 
 @Component({
@@ -32,7 +33,7 @@ export class App implements OnInit {
   readonly error = signal<string | null>(null);
   readonly sidebarCollapsed = signal(false);
 
-  draft = 'Получить список MCP-инструментов';
+  draft = 'Какая сейчас погода в Москве?';
 
   ngOnInit(): void {
     void Promise.all([this.loadSessions(), this.refreshStatus()]);
@@ -85,7 +86,7 @@ export class App implements OnInit {
     }
   }
 
-  async requestTools(): Promise<void> {
+  async sendMessage(): Promise<void> {
     const message = this.draft.trim();
     if (!message || this.pending()) return;
     this.pending.set(true);
@@ -96,12 +97,13 @@ export class App implements OnInit {
         session = await this.api.createSession();
         this.activeSession.set(session);
       }
-      const result = await this.api.listTools(session.id, message);
+      const result = await this.api.sendMessage(session.id, message);
       this.activeSession.set(result.session);
+      this.draft = '';
       this.status.set({
         connected: true,
         server_url: result.server_url,
-        tool_count: result.tools.length,
+        tool_count: this.status()?.tool_count ?? null,
         error: null,
       });
       await this.reloadSessionList(session.id);
@@ -141,12 +143,16 @@ export class App implements OnInit {
   handleKeydown(event: KeyboardEvent): void {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      void this.requestTools();
+      void this.sendMessage();
     }
   }
 
   toolsFor(message: { mcp_data: { tools?: MCPTool[] } | null }): MCPTool[] {
     return message.mcp_data?.tools ?? [];
+  }
+
+  toolCallsFor(message: { mcp_data: { tool_calls?: MCPToolCall[] } | null }): MCPToolCall[] {
+    return message.mcp_data?.tool_calls ?? [];
   }
 
   toggleSidebar(): void {
