@@ -108,7 +108,17 @@ class WeatherServiceTests(unittest.IsolatedAsyncioTestCase):
 class MCPDefinitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_schema_requires_described_bounded_city(self) -> None:
         tools = await mcp.list_tools()
-        self.assertEqual([tool.name for tool in tools], ["get_current_weather"])
+        self.assertEqual(
+            [tool.name for tool in tools],
+            [
+                "get_current_weather",
+                "create_weather_schedule",
+                "list_weather_schedules",
+                "stop_weather_schedule",
+                "run_weather_collection_now",
+                "get_weather_summary",
+            ],
+        )
 
         schema = tools[0].input_schema
         city = schema["properties"]["city"]
@@ -117,6 +127,14 @@ class MCPDefinitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(city["minLength"], 1)
         self.assertEqual(city["maxLength"], MAX_CITY_LENGTH)
         self.assertIn("пробелы", city["description"])
+
+        create_schema = tools[1].input_schema
+        self.assertEqual(create_schema["required"], ["city", "interval_seconds"])
+        self.assertEqual(create_schema["properties"]["interval_seconds"]["minimum"], 30)
+
+        summary_schema = tools[-1].input_schema
+        self.assertEqual(summary_schema["required"], ["city", "minutes"])
+        self.assertEqual(summary_schema["properties"]["minutes"]["minimum"], 1)
 
         self.assertEqual(
             set(tools[0].output_schema["properties"]),

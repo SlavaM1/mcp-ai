@@ -13,6 +13,8 @@ Browser
   -> FastAPI agent
        -> OpenAI-compatible LLM
        -> MCP ClientSession -> weather-mcp -> Open-Meteo
+                              -> APScheduler -> Open-Meteo
+                              -> SQLite weather schedules and samples
        -> SQLAlchemy -> PostgreSQL 17
 ```
 
@@ -39,9 +41,31 @@ Internal MCP endpoint: `http://weather-mcp:8001/mcp`.
 
 Published MCP endpoint: `http://localhost:8001/mcp`.
 
-Registered tool: `get_current_weather`, with one required, trimmed, non-empty `city` string of at
-most 100 characters. Temperatures are Celsius, relative humidity is percent, and wind speed is
-km/h.
+The MCP server registers these tools dynamically, so the existing agent discovers all of them through
+`ClientSession.list_tools()`:
+
+- `get_current_weather`: current Open-Meteo conditions without storing a sample.
+- `create_weather_schedule`: create background collection for a city and interval in seconds.
+- `list_weather_schedules`: list active and stopped schedules.
+- `stop_weather_schedule`: stop a schedule while retaining its history.
+- `run_weather_collection_now`: fetch and persist a single measurement immediately.
+- `get_weather_summary`: aggregate stored measurements for a requested period.
+
+All city values are trimmed, non-empty strings of at most 100 characters. Temperatures are Celsius,
+relative humidity is percent, and wind speed is km/h.
+
+### Background Weather Collection
+
+`weather-mcp` runs APScheduler inside its own process. Once `create_weather_schedule` creates a
+schedule, collection continues independently of the browser, FastAPI agent, and LLM for as long as
+the `weather-mcp` container runs. A job runs at most once concurrently (`max_instances=1`), provider
+errors are logged without disabling it, and missed intervals are coalesced rather than replayed.
+
+For a demonstration, ask the chat: `Начни собирать погоду в Новосибирске каждую минуту.` This maps to
+`create_weather_schedule` with `{"city":"Новосибирск","interval_seconds":60}`. The minimum supported
+interval is 30 seconds. Later ask: `Дай сводку погоды по Новосибирску за последний час.` The agent can
+select `get_weather_summary`, which returns sample count, actual data range, and min/max/average
+metrics, including first and last temperature.
 
 ## Configuration
 
@@ -71,6 +95,7 @@ diagnostic instead of reporting an MCP failure.
 | `MCP_SERVER_URL` | `http://weather-mcp:8001/mcp` | Streamable HTTP endpoint |
 | `MCP_TIMEOUT_SECONDS` | `30` | MCP timeout |
 | `DATABASE_URL` | Compose PostgreSQL URL | SQLAlchemy URL |
+| `WEATHER_DATABASE_PATH` | `/data/weather.db` in Compose | SQLite file for weather schedules and samples |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | environment/default | Standard proxy settings |
 | `FRONTEND_PORT`, `BACKEND_PORT`, `WEATHER_MCP_PORT` | `4201`, `8000`, `8001` | Published ports |
 
@@ -88,7 +113,11 @@ Open:
 - Backend health: <http://localhost:8000/health>
 - Weather MCP health: <http://localhost:8001/health>
 
-PostgreSQL data is stored in the named volume `mcp-ai-postgres-data`. Stop without removing it:
+PostgreSQL chat data is stored in the named volume `mcp-ai-postgres-data`. Weather schedules and
+collected measurements are stored separately in SQLite at `/data/weather.db`, mounted as the named
+volume `mcp-ai-weather-mcp-data`. Both persist through a normal `docker compose down` followed by
+`docker compose up -d`; active weather schedules are loaded and registered again when `weather-mcp`
+starts. Stop without removing these volumes:
 
 ```bash
 docker compose down
@@ -126,16 +155,20 @@ docker compose run --build --rm \
 docker compose build frontend
 ```
 
-Automated tests cover MCP normalization and errors, agent-selected and ordinary no-tool turns,
-rejection of unadvertised tools, database persistence, Open-Meteo parsing and error categories, and
-the generated MCP schema. Final Open-Meteo verification should use the running containers without
-mocks.
+Automated tests cover MCP normalization and schemas, agent-selected and ordinary no-tool turns,
+rejection of unadvertised tools, PostgreSQL persistence, Open-Meteo parsing and error categories,
+SQLite schedule/sample persistence, duplicate and stopped schedules, scheduler recovery, provider
+errors, manual collection, and summary aggregation. Final Open-Meteo and scheduler verification
+should use the running containers without mocks.
 
 ## Persistence
 
 Alembic owns the existing `chat_sessions` and `chat_messages` schema. No Day 17 migration is needed:
 tool name, arguments, result/error, duration, server URL, and discovered tools fit the existing JSONB
 `mcp_data` field. The named PostgreSQL volume preserves sessions across rebuilds and restarts.
+
+SQLite is deliberately local to `weather-mcp`; it owns `weather_schedules` and `weather_samples` only.
+It does not alter or replace the PostgreSQL chat schema.
 
 ## Limitations
 
