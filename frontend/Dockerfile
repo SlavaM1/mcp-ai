@@ -5,7 +5,6 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/angular.json frontend/tsconfig.json frontend/tsconfig.app.json ./
 COPY frontend/src ./src
-COPY frontend/public ./public
 RUN npm run build
 
 FROM nginx:1.29.1-alpine AS runtime
