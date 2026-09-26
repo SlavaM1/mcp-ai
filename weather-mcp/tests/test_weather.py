@@ -73,6 +73,19 @@ WTTR_RESPONSE = {
             "maxtempC": "10",
             "avgtempC": "6",
             "astronomy": [{}],
+            "hourly": [
+                {
+                    "time": "1200",
+                    "tempC": "7",
+                    "FeelsLikeC": "5",
+                    "weatherDesc": [{"value": "Light rain"}],
+                    "humidity": "81",
+                    "precipMM": "1.3",
+                    "chanceofrain": "85",
+                    "windspeedKmph": "19",
+                    "winddir16Point": "W",
+                }
+            ],
         },
     ],
 }
@@ -171,6 +184,9 @@ class WeatherServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item.date for item in forecast.forecast], ["2026-09-25", "2026-09-26"])
         self.assertEqual(forecast.forecast[0].moon_phase, "Waxing Gibbous")
+        self.assertEqual(forecast.forecast[0].humidity_percent, 75)
+        self.assertEqual(forecast.forecast[1].precipitation_mm, 1.3)
+        self.assertEqual(forecast.forecast[1].conditions, ["Light rain"])
         self.assertEqual(hourly.date, "2026-09-25")
         self.assertEqual(hourly.hours[0].time, "12:00")
         self.assertEqual(hourly.hours[0].chance_of_rain_percent, 20)
@@ -184,6 +200,8 @@ class MCPDefinitionTests(unittest.IsolatedAsyncioTestCase):
             [
                 "get_current_weather",
                 "get_weather_forecast",
+                "analyze_weather",
+                "save_weather_report",
                 "get_hourly_weather",
                 "create_weather_schedule",
                 "list_weather_schedules",
@@ -204,6 +222,15 @@ class MCPDefinitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(forecast_schema["required"], ["city", "days"])
         self.assertEqual(forecast_schema["properties"]["days"]["minimum"], 1)
         self.assertEqual(forecast_schema["properties"]["days"]["maximum"], 3)
+
+        analyze_schema = tools[2].input_schema
+        self.assertEqual(analyze_schema["required"], ["weather_data"])
+        self.assertIn("get_weather_forecast", tools[2].description)
+
+        report_schema = tools[3].input_schema
+        self.assertEqual(report_schema["required"], ["analysis"])
+        self.assertEqual(report_schema["properties"]["format"]["const"], "markdown")
+        self.assertIn("analyze_weather", tools[3].description)
 
         summary_schema = tools[-1].input_schema
         self.assertEqual(summary_schema["required"], ["city", "minutes"])

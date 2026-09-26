@@ -5,7 +5,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from os import getenv
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 import httpx2
 from mcp.server import MCPServer
@@ -19,6 +20,7 @@ from starlette.responses import JSONResponse
 from weather_mcp import __version__
 from weather_mcp.logging_config import configure_json_logging
 from weather_mcp.persistence import WeatherRepository, WeatherSample, WeatherSchedule, to_timestamp, utc_now
+from weather_mcp.reporting import SavedReport, WeatherAnalysis, build_weather_analysis, write_weather_report
 from weather_mcp.scheduler import WeatherScheduler
 from weather_mcp.weather import (
     HourlyWeatherResult,
@@ -72,6 +74,7 @@ class AppContext:
     weather: WeatherService
     repository: WeatherRepository
     scheduler: WeatherScheduler
+    reports_directory: Path
 
 
 class ScheduleResult(BaseModel):
@@ -159,7 +162,12 @@ async def lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
         scheduler = WeatherScheduler(repository, weather)
         scheduler.start()
         try:
-            yield AppContext(weather=weather, repository=repository, scheduler=scheduler)
+            yield AppContext(
+                weather=weather,
+                repository=repository,
+                scheduler=scheduler,
+                reports_directory=Path(getenv("WEATHER_REPORTS_DIRECTORY", "/data/reports")),
+            )
         finally:
             scheduler.shutdown()
             repository.close()
@@ -186,8 +194,9 @@ async def get_current_weather(city: City, ctx: Context[AppContext, Any]) -> Weat
 
 @mcp.tool(
     description=(
-        "Получить прогноз погоды в указанном пользователем городе на несколько ближайших дней. "
-        "days принимает от 1 до 3, что соответствует доступному прогнозу wttr.in."
+        "Gets structured forecast data for a requested city and number of days. "
+        "Use this when weather data is needed for further analysis or a report. "
+        "days accepts 1 to 3, matching the forecast available from wttr.in."
     )
 )
 async def get_weather_forecast(
@@ -196,6 +205,40 @@ async def get_weather_forecast(
     ctx: Context[AppContext, Any],
 ) -> WeatherForecastResult:
     return await ctx.request_context.lifespan_context.weather.get_weather_forecast(city, days)
+
+
+@mcp.tool(
+    description=(
+        "Analyzes structured weather forecast data supplied in weather_data. "
+        "Use the structured output of get_weather_forecast as weather_data. "
+        "Does not fetch weather itself. Returns deterministic aggregated weather statistics "
+        "suitable for a report."
+    )
+)
+async def analyze_weather(weather_data: WeatherForecastResult) -> WeatherAnalysis:
+    return build_weather_analysis(weather_data)
+
+
+@mcp.tool(
+    description=(
+        "Saves an already prepared weather analysis as a Markdown report. "
+        "Use the structured output of analyze_weather as the analysis argument. "
+        "Does not fetch or analyze weather itself."
+    )
+)
+async def save_weather_report(
+    analysis: WeatherAnalysis,
+    ctx: Context[AppContext, Any],
+    format: Annotated[
+        Literal["markdown"],
+        Field(description="Report format. Only markdown is supported."),
+    ] = "markdown",
+) -> SavedReport:
+    del format
+    return write_weather_report(
+        analysis,
+        ctx.request_context.lifespan_context.reports_directory,
+    )
 
 
 @mcp.tool(

@@ -104,11 +104,11 @@
                         <small>{{ message.mcp_data?.server_url }}</small>
                       </div>
                       <div class="tool-call-list">
-                        @for (call of toolCallsFor(message); track call.id) {
+                        @for (call of toolCallsFor(message); track call.id; let callIndex = $index) {
                           <article class="tool-call-card" [class.tool-call-failed]="call.error">
                             <div class="tool-call-heading">
                               <span class="tool-glyph" aria-hidden="true">CALL</span>
-                              <h3>{{ call.name }}</h3>
+                              <h3>{{ call.sequence ?? callIndex + 1 }}. {{ call.name }}</h3>
                               @if (call.duration_ms !== null && call.duration_ms !== undefined) {
                                 <time>{{ call.duration_ms }} ms</time>
                               }

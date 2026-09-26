@@ -124,6 +124,37 @@ async def test_agent_rejects_tool_not_returned_by_mcp():
 
 
 @pytest.mark.asyncio
+async def test_agent_returns_invalid_arguments_to_llm_as_controlled_tool_error():
+    mcp = FakeMCPClient()
+    llm = FakeLLMClient(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-invalid",
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "arguments": "not-json",
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "Аргументы некорректны.", "tool_calls": []},
+        ]
+    )
+
+    result = await ChatAgent(mcp, llm, max_tool_calls=4).run([], "Какая погода?")
+
+    assert mcp.calls == []
+    assert result.tool_calls[0]["arguments"] == {}
+    assert "некорректные аргументы" in result.tool_calls[0]["error"]
+    assert result.tool_calls[0]["sequence"] == 1
+
+
+@pytest.mark.asyncio
 async def test_tool_call_batch_is_rejected_before_partial_execution():
     mcp = FakeMCPClient()
     tool_call = {
@@ -147,3 +178,85 @@ async def test_tool_call_batch_is_rejected_before_partial_execution():
         await ChatAgent(mcp, llm, max_tool_calls=1).run([], "Сравни погоду")
 
     assert mcp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_composes_three_tools_and_passes_results_between_them():
+    forecast = {
+        "city": "Novosibirsk",
+        "forecast": [{"date": "2026-09-26", "avg_temperature_c": 5}],
+    }
+    analysis = {
+        "city": "Novosibirsk",
+        "period": {"from": "2026-09-26", "to": "2026-09-28", "days": 3},
+        "temperature": {"avg_c": 5.2},
+    }
+    saved = {
+        "saved": True,
+        "file_name": "weather-report-novosibirsk.md",
+        "path": "/data/reports/weather-report-novosibirsk.md",
+        "format": "markdown",
+    }
+
+    class CompositionMCPClient(FakeMCPClient):
+        async def list_tools(self):
+            return [
+                {**TOOL, "name": "get_weather_forecast"},
+                {**TOOL, "name": "analyze_weather"},
+                {**TOOL, "name": "save_weather_report"},
+            ]
+
+        async def call_tool(self, name, arguments):
+            self.calls.append((name, arguments))
+            results = {
+                "get_weather_forecast": forecast,
+                "analyze_weather": analysis,
+                "save_weather_report": saved,
+            }
+            return {
+                "is_error": False,
+                "content": [{"type": "text", "text": "ok"}],
+                "structured_content": results[name],
+            }
+
+    def tool_call(call_id, name, arguments):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+
+    mcp = CompositionMCPClient()
+    llm = FakeLLMClient(
+        [
+            tool_call("call-1", "get_weather_forecast", '{"city":"Новосибирск","days":3}'),
+            tool_call("call-2", "analyze_weather", {"weather_data": forecast}),
+            tool_call(
+                "call-3",
+                "save_weather_report",
+                {"analysis": analysis, "format": "markdown"},
+            ),
+            {"role": "assistant", "content": "Отчёт сохранён.", "tool_calls": []},
+        ]
+    )
+
+    result = await ChatAgent(mcp, llm, max_tool_calls=3).run([], "Сделай отчёт")
+
+    assert result.content == "Отчёт сохранён."
+    assert [call[0] for call in mcp.calls] == [
+        "get_weather_forecast",
+        "analyze_weather",
+        "save_weather_report",
+    ]
+    assert mcp.calls[1][1]["weather_data"] == forecast
+    assert mcp.calls[2][1]["analysis"] == analysis
+    assert [call["sequence"] for call in result.tool_calls] == [1, 2, 3]
+    assert result.tool_calls[0]["result"]["structured_content"] == forecast
+    assert result.tool_calls[1]["result"]["structured_content"] == analysis
+    assert len(llm.requests) == 4

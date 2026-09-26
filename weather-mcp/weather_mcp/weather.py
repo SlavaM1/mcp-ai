@@ -62,6 +62,10 @@ class ForecastDay(BaseModel):
     min_temperature_c: float
     max_temperature_c: float
     avg_temperature_c: float
+    humidity_percent: float
+    max_wind_kmh: float
+    precipitation_mm: float
+    conditions: list[str]
     sunrise: str | None = None
     sunset: str | None = None
     moon_phase: str | None = None
@@ -194,12 +198,17 @@ class WeatherService:
                 if not isinstance(item, dict):
                     raise ValueError("weather item is not an object")
                 astronomy = _first_dict(item.get("astronomy")) or {}
+                humidity, max_wind, precipitation, conditions = _daily_weather_details(item)
                 forecast.append(
                     ForecastDay(
                         date=_required_text(item, "date"),
                         min_temperature_c=_required_number(item, "mintempC"),
                         max_temperature_c=_required_number(item, "maxtempC"),
                         avg_temperature_c=_required_number(item, "avgtempC"),
+                        humidity_percent=humidity,
+                        max_wind_kmh=max_wind,
+                        precipitation_mm=precipitation,
+                        conditions=conditions,
                         sunrise=_optional_text(astronomy.get("sunrise")),
                         sunset=_optional_text(astronomy.get("sunset")),
                         moon_phase=_optional_text(astronomy.get("moon_phase")),
@@ -277,6 +286,33 @@ def _provider_reports_unknown_city(payload: dict[str, Any]) -> bool:
     if not isinstance(errors, list):
         return False
     return any(_text_value(item.get("msg")) for item in errors if isinstance(item, dict))
+
+
+def _daily_weather_details(item: dict[str, Any]) -> tuple[float, float, float, list[str]]:
+    hourly = item.get("hourly")
+    if not isinstance(hourly, list) or not hourly:
+        raise ValueError("missing hourly forecast")
+    humidities: list[int] = []
+    wind_speeds: list[float] = []
+    precipitation: list[float] = []
+    conditions: list[str] = []
+    for hour in hourly:
+        if not isinstance(hour, dict):
+            raise ValueError("hourly item is not an object")
+        humidities.append(_required_int(hour, "humidity"))
+        wind_speeds.append(_required_number(hour, "windspeedKmph"))
+        precipitation.append(_required_number(hour, "precipMM"))
+        condition = _text_value(hour.get("weatherDesc"))
+        if condition:
+            conditions.append(condition)
+    if not conditions:
+        raise ValueError("missing weather condition")
+    return (
+        round(sum(humidities) / len(humidities), 1),
+        max(wind_speeds),
+        round(sum(precipitation), 1),
+        list(dict.fromkeys(conditions)),
+    )
 
 
 def _first_dict(value: Any) -> dict[str, Any] | None:

@@ -1,9 +1,9 @@
 # mcp-ai
 
 Persisted Angular chat with a Python agent that discovers and invokes tools through Model Context
-Protocol. The bundled MCP server gets weather from wttr.in and returns normalized current, forecast,
-and hourly data for any city supplied by the user. The LLM uses OpenAI-compatible chat completions
-with function calling.
+Protocol. The bundled MCP server gets weather from wttr.in, returns normalized current, forecast,
+and hourly data for any city supplied by the user, analyzes forecasts, and stores Markdown reports.
+The LLM uses OpenAI-compatible chat completions with function calling.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ with function calling.
 Browser
   -> nginx / Angular 20
   -> FastAPI agent
-       -> OpenAI-compatible LLM
+        -> OpenAI-compatible DeepSeek API
         -> MCP ClientSession -> weather-mcp -> wttr.in
                                -> APScheduler -> wttr.in
                               -> SQLite weather schedules and samples
@@ -36,6 +36,7 @@ and existing saved payloads continue to render in the UI.
 | `weather-mcp` | MCP 2.2 Streamable HTTP server and wttr.in client | `8001` |
 | `db` | PostgreSQL 17 | internal only |
 | `backend-test` | Optional pytest image | none |
+| `weather-mcp-test` | Optional weather MCP unittest image | none |
 
 Internal MCP endpoint: `http://weather-mcp:8001/mcp`.
 
@@ -45,7 +46,10 @@ The MCP server registers these tools dynamically, so the existing agent discover
 `ClientSession.list_tools()`:
 
 - `get_current_weather`: current weather in the requested city without storing a sample.
-- `get_weather_forecast`: normalized weather forecast for one to three days.
+- `get_weather_forecast`: normalized weather forecast for one to three days, including daily
+  temperature, humidity, wind, precipitation, and conditions.
+- `analyze_weather`: deterministic aggregates calculated from supplied structured forecast data.
+- `save_weather_report`: save supplied weather analysis as a safe, uniquely named Markdown report.
 - `get_hourly_weather`: normalized hourly forecast for the current or nearest day.
 - `create_weather_schedule`: create background collection for a city and interval in seconds.
 - `list_weather_schedules`: list active and stopped schedules.
@@ -67,8 +71,39 @@ city names and the HTTP client honors standard `HTTP_PROXY`, `HTTPS_PROXY`, and 
 
 Current weather includes resolved location, temperature, feels-like temperature, condition, humidity,
 pressure, wind, precipitation, cloud cover, visibility, UV index, and provider observation time when
-available. Forecast results include daily temperatures, sunrise/sunset, and moon phase. Hourly results
-include temperature, feels-like temperature, condition, humidity, precipitation chance, and wind.
+available. Forecast results include daily temperatures, average humidity, maximum wind, total
+precipitation, conditions, sunrise/sunset, and moon phase. Hourly results include temperature,
+feels-like temperature, condition, humidity, precipitation chance, and wind.
+
+### MCP Tool Composition
+
+The existing Agent loop supports multiple sequential MCP calls during one chat turn. For example:
+
+```text
+get_weather_forecast
+    -> analyze_weather
+    -> save_weather_report
+```
+
+Send one user message:
+
+```text
+Собери прогноз погоды по Новосибирску на 3 дня,
+проанализируй данные и сохрани отчет в файл.
+```
+
+DeepSeek selects each tool from the schemas and descriptions returned by `ClientSession.list_tools()`.
+The Agent executes the selected MCP call, returns its `structured_content` to DeepSeek, and continues
+the same generic tool-calling loop. The output of `get_weather_forecast` is passed in the
+`weather_data` argument of `analyze_weather`; that analysis is then passed in the `analysis` argument
+of `save_weather_report`. There is no hardcoded report pipeline or keyword orchestration in the
+Agent.
+
+`analyze_weather` does not call wttr.in or an LLM. It calculates temperature, humidity, wind, and
+precipitation aggregates with Python. `save_weather_report` neither fetches nor analyzes weather. It
+writes a uniquely named Markdown file under `/data/reports`, which is inside the existing persistent
+`mcp-ai-weather-mcp-data` Docker volume. The technical payload saved in PostgreSQL contains the
+ordered `tool_calls` array with arguments, results, errors, and duration for every step.
 
 ### Background Weather Collection
 
@@ -112,6 +147,7 @@ diagnostic instead of reporting an MCP failure.
 | `MCP_TIMEOUT_SECONDS` | `30` | MCP timeout |
 | `DATABASE_URL` | Compose PostgreSQL URL | SQLAlchemy URL |
 | `WEATHER_DATABASE_PATH` | `/data/weather.db` in Compose | SQLite file for weather schedules and samples |
+| `WEATHER_REPORTS_DIRECTORY` | `/data/reports` in Compose | Directory for generated Markdown reports |
 | `WEATHER_BASE_URL` | `https://wttr.in` | Weather provider base URL |
 | `WEATHER_HTTP_TIMEOUT_SECONDS` | `15` | Timeout for one wttr.in request |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | environment/default | Standard proxy settings |
@@ -132,8 +168,9 @@ Open:
 - Weather MCP health: <http://localhost:8001/health>
 
 PostgreSQL chat data is stored in the named volume `mcp-ai-postgres-data`. Weather schedules and
-collected measurements are stored separately in SQLite at `/data/weather.db`, mounted as the named
-volume `mcp-ai-weather-mcp-data`. Both persist through a normal `docker compose down` followed by
+collected measurements are stored separately in SQLite at `/data/weather.db`; generated reports are
+stored under `/data/reports`. Both paths are mounted through the named volume
+`mcp-ai-weather-mcp-data`. All data persists through a normal `docker compose down` followed by
 `docker compose up -d`; active weather schedules are loaded and registered again when `weather-mcp`
 starts. Stop without removing these volumes:
 
@@ -172,10 +209,12 @@ docker compose build frontend
 ```
 
 Automated tests cover MCP normalization and schemas, agent-selected and ordinary no-tool turns,
-rejection of unadvertised tools, PostgreSQL persistence, wttr.in parsing, URL encoding, error
-categories, forecast and hourly normalization, SQLite schedule/sample persistence, duplicate and
+rejection of unadvertised tools, three-step composition and payload transfer, multi-call PostgreSQL
+persistence, wttr.in parsing, URL encoding, error categories, forecast and hourly normalization,
+analysis calculations, safe report generation, SQLite schedule/sample persistence, duplicate and
 stopped schedules, scheduler recovery, provider errors, manual collection, and summary aggregation.
-Final wttr.in and scheduler verification should use the running containers without mocks.
+Final DeepSeek, wttr.in, report persistence, and scheduler verification should use the running
+containers without mocks.
 
 ## Persistence
 
@@ -184,7 +223,8 @@ tool name, arguments, result/error, duration, server URL, and discovered tools f
 `mcp_data` field. The named PostgreSQL volume preserves sessions across rebuilds and restarts.
 
 SQLite is deliberately local to `weather-mcp`; it owns `weather_schedules` and `weather_samples` only.
-It does not alter or replace the PostgreSQL chat schema.
+Markdown reports share the weather MCP data volume but are not stored in SQLite. Neither changes or
+replaces the PostgreSQL chat schema.
 
 ## Limitations
 

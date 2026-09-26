@@ -10,6 +10,7 @@ export interface MCPTool {
 
 export interface MCPToolCall {
   id: string;
+  sequence?: number;
   name: string;
   arguments: unknown;
   result?: unknown;
