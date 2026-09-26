@@ -1,9 +1,9 @@
 # mcp-ai
 
 Persisted Angular chat with a Python agent that discovers and invokes tools through Model Context
-Protocol. The bundled MCP server resolves a city through Open-Meteo Geocoding, reads current weather
-from Open-Meteo Forecast, and returns a structured result. The LLM uses OpenAI-compatible chat
-completions with function calling.
+Protocol. The bundled MCP server gets weather from wttr.in and returns normalized current, forecast,
+and hourly data for any city supplied by the user. The LLM uses OpenAI-compatible chat completions
+with function calling.
 
 ## Architecture
 
@@ -12,8 +12,8 @@ Browser
   -> nginx / Angular 20
   -> FastAPI agent
        -> OpenAI-compatible LLM
-       -> MCP ClientSession -> weather-mcp -> Open-Meteo
-                              -> APScheduler -> Open-Meteo
+        -> MCP ClientSession -> weather-mcp -> wttr.in
+                               -> APScheduler -> wttr.in
                               -> SQLite weather schedules and samples
        -> SQLAlchemy -> PostgreSQL 17
 ```
@@ -33,7 +33,7 @@ and existing saved payloads continue to render in the UI.
 | --- | --- | --- |
 | `frontend` | Production Angular build served by nginx | `4201` |
 | `backend` | FastAPI agent, MCP client, persistence, Alembic | `8000` |
-| `weather-mcp` | MCP 2.2 Streamable HTTP server and Open-Meteo client | `8001` |
+| `weather-mcp` | MCP 2.2 Streamable HTTP server and wttr.in client | `8001` |
 | `db` | PostgreSQL 17 | internal only |
 | `backend-test` | Optional pytest image | none |
 
@@ -44,15 +44,31 @@ Published MCP endpoint: `http://localhost:8001/mcp`.
 The MCP server registers these tools dynamically, so the existing agent discovers all of them through
 `ClientSession.list_tools()`:
 
-- `get_current_weather`: current Open-Meteo conditions without storing a sample.
+- `get_current_weather`: current weather in the requested city without storing a sample.
+- `get_weather_forecast`: normalized weather forecast for one to three days.
+- `get_hourly_weather`: normalized hourly forecast for the current or nearest day.
 - `create_weather_schedule`: create background collection for a city and interval in seconds.
 - `list_weather_schedules`: list active and stopped schedules.
 - `stop_weather_schedule`: stop a schedule while retaining its history.
 - `run_weather_collection_now`: fetch and persist a single measurement immediately.
 - `get_weather_summary`: aggregate stored measurements for a requested period.
 
-All city values are trimmed, non-empty strings of at most 100 characters. Temperatures are Celsius,
-relative humidity is percent, and wind speed is km/h.
+All city values are trimmed, non-empty strings of at most 100 characters. The Agent extracts the city
+from ordinary user text through its existing DeepSeek function-calling flow; city names are not
+hardcoded. Temperatures are Celsius, humidity is percent, and wind speed is km/h.
+
+### Weather Provider
+
+Weather provider: **wttr.in**
+
+Endpoint: `https://wttr.in/{city}?format=j1`, for example
+<https://wttr.in/Novosibirsk?format=j1>. An API key is not required. The provider request URL-encodes
+city names and the HTTP client honors standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` settings.
+
+Current weather includes resolved location, temperature, feels-like temperature, condition, humidity,
+pressure, wind, precipitation, cloud cover, visibility, UV index, and provider observation time when
+available. Forecast results include daily temperatures, sunrise/sunset, and moon phase. Hourly results
+include temperature, feels-like temperature, condition, humidity, precipitation chance, and wind.
 
 ### Background Weather Collection
 
@@ -96,6 +112,8 @@ diagnostic instead of reporting an MCP failure.
 | `MCP_TIMEOUT_SECONDS` | `30` | MCP timeout |
 | `DATABASE_URL` | Compose PostgreSQL URL | SQLAlchemy URL |
 | `WEATHER_DATABASE_PATH` | `/data/weather.db` in Compose | SQLite file for weather schedules and samples |
+| `WEATHER_BASE_URL` | `https://wttr.in` | Weather provider base URL |
+| `WEATHER_HTTP_TIMEOUT_SECONDS` | `15` | Timeout for one wttr.in request |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | environment/default | Standard proxy settings |
 | `FRONTEND_PORT`, `BACKEND_PORT`, `WEATHER_MCP_PORT` | `4201`, `8000`, `8001` | Published ports |
 
@@ -149,17 +167,15 @@ Other endpoints:
 
 ```bash
 docker compose --profile test run --build --rm backend-test
-docker compose run --build --rm \
-  -v "$PWD/weather-mcp/tests:/app/tests:ro" \
-  weather-mcp python -m unittest discover -s tests
+docker compose --profile test run --build --rm weather-mcp-test
 docker compose build frontend
 ```
 
 Automated tests cover MCP normalization and schemas, agent-selected and ordinary no-tool turns,
-rejection of unadvertised tools, PostgreSQL persistence, Open-Meteo parsing and error categories,
-SQLite schedule/sample persistence, duplicate and stopped schedules, scheduler recovery, provider
-errors, manual collection, and summary aggregation. Final Open-Meteo and scheduler verification
-should use the running containers without mocks.
+rejection of unadvertised tools, PostgreSQL persistence, wttr.in parsing, URL encoding, error
+categories, forecast and hourly normalization, SQLite schedule/sample persistence, duplicate and
+stopped schedules, scheduler recovery, provider errors, manual collection, and summary aggregation.
+Final wttr.in and scheduler verification should use the running containers without mocks.
 
 ## Persistence
 
@@ -173,6 +189,6 @@ It does not alter or replace the PostgreSQL chat schema.
 ## Limitations
 
 - A configured external OpenAI-compatible model with tool-calling support is required for chat.
-- Open-Meteo and the configured LLM are external dependencies without a project SLA.
+- wttr.in and the configured LLM are external dependencies without a project SLA.
 - Authentication and multi-user isolation are not implemented.
 - MCP and LLM connections are request-scoped; requests are not queued or streamed to the UI.

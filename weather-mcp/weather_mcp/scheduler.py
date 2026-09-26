@@ -97,8 +97,14 @@ class WeatherScheduler:
             WeatherSample(
                 city=city,
                 collected_at=utc_now(),
-                temperature_c=weather.temperature,
-                relative_humidity_percent=weather.relative_humidity,
-                wind_speed_kmh=weather.wind_speed,
+                temperature_c=weather.temperature_c,
+                humidity_percent=weather.humidity_percent,
+                wind_speed_kmh=weather.wind_speed_kmh,
+                feels_like_c=weather.feels_like_c,
+                pressure_hpa=weather.pressure_hpa,
+                precipitation_mm=weather.precipitation_mm,
+                cloud_cover_percent=weather.cloud_cover_percent,
+                visibility_km=weather.visibility_km,
+                condition=weather.condition,
             )
         )

@@ -20,11 +20,26 @@ from weather_mcp import __version__
 from weather_mcp.logging_config import configure_json_logging
 from weather_mcp.persistence import WeatherRepository, WeatherSample, WeatherSchedule, to_timestamp, utc_now
 from weather_mcp.scheduler import WeatherScheduler
-from weather_mcp.weather import WeatherResult, WeatherService
+from weather_mcp.weather import (
+    HourlyWeatherResult,
+    WeatherForecastResult,
+    WeatherResult,
+    WeatherService,
+    WttrWeatherClient,
+)
 
 MAX_CITY_LENGTH = 100
 MIN_INTERVAL_SECONDS = 30
-HTTP_TIMEOUT = httpx2.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0)
+
+
+def _weather_timeout() -> httpx2.Timeout:
+    try:
+        seconds = float(getenv("WEATHER_HTTP_TIMEOUT_SECONDS", "15"))
+    except ValueError:
+        seconds = 15.0
+    if seconds <= 0:
+        seconds = 15.0
+    return httpx2.Timeout(seconds)
 
 
 def _normalize_city(value: Any) -> str:
@@ -84,8 +99,14 @@ class WeatherSampleResult(BaseModel):
     city: str
     collected_at: str
     temperature_c: float
-    relative_humidity_percent: int
+    feels_like_c: float | None
+    humidity_percent: int
+    pressure_hpa: int | None
     wind_speed_kmh: float
+    precipitation_mm: float | None
+    cloud_cover_percent: int | None
+    visibility_km: float | None
+    condition: str | None
 
 
 class WeatherMetrics(BaseModel):
@@ -99,6 +120,11 @@ class TemperatureMetrics(WeatherMetrics):
     last: float
 
 
+class PrecipitationMetrics(BaseModel):
+    total: float
+    max: float
+
+
 class WeatherSummary(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
@@ -108,8 +134,12 @@ class WeatherSummary(BaseModel):
     from_: str | None = Field(alias="from")
     to: str | None
     temperature: TemperatureMetrics | None
-    relative_humidity_percent: WeatherMetrics | None
+    feels_like: WeatherMetrics | None
+    humidity: WeatherMetrics | None
+    pressure_hpa: WeatherMetrics | None
     wind_speed_kmh: WeatherMetrics | None
+    precipitation_mm: PrecipitationMetrics | None
+    conditions: list[str] | None = None
     message: str | None = None
 
 
@@ -117,16 +147,19 @@ class WeatherSummary(BaseModel):
 async def lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
     limits = httpx2.Limits(max_connections=100, max_keepalive_connections=20)
     async with httpx2.AsyncClient(
-        timeout=HTTP_TIMEOUT,
+        timeout=_weather_timeout(),
         limits=limits,
         trust_env=True,
         headers={"User-Agent": f"weather-mcp/{__version__}"},
     ) as client:
         repository = WeatherRepository(getenv("WEATHER_DATABASE_PATH", "/data/weather.db"))
-        scheduler = WeatherScheduler(repository, WeatherService(client))
+        weather = WeatherService(
+            WttrWeatherClient(client, getenv("WEATHER_BASE_URL", "https://wttr.in"))
+        )
+        scheduler = WeatherScheduler(repository, weather)
         scheduler.start()
         try:
-            yield AppContext(weather=WeatherService(client), repository=repository, scheduler=scheduler)
+            yield AppContext(weather=weather, repository=repository, scheduler=scheduler)
         finally:
             scheduler.shutdown()
             repository.close()
@@ -134,7 +167,7 @@ async def lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
 
 mcp = MCPServer[AppContext](
     "weather-mcp",
-    description="Current weather from Open-Meteo",
+    description="Weather data from wttr.in",
     version=__version__,
     lifespan=lifespan,
 )
@@ -142,8 +175,9 @@ mcp = MCPServer[AppContext](
 
 @mcp.tool(
     description=(
-        "Получить текущую погоду в городе через Open-Meteo. "
-        "Температура возвращается в °C, влажность в %, скорость ветра в км/ч."
+        "Получить текущую погоду в указанном пользователем городе через wttr.in. "
+        "Возвращает температуру в °C, ощущаемую температуру, влажность, давление, ветер, "
+        "осадки, облачность и видимость, а также фактически найденную локацию."
     )
 )
 async def get_current_weather(city: City, ctx: Context[AppContext, Any]) -> WeatherResult:
@@ -152,7 +186,31 @@ async def get_current_weather(city: City, ctx: Context[AppContext, Any]) -> Weat
 
 @mcp.tool(
     description=(
-        "Создать фоновое периодическое наблюдение за погодой города. Сбор выполняется самим "
+        "Получить прогноз погоды в указанном пользователем городе на несколько ближайших дней. "
+        "days принимает от 1 до 3, что соответствует доступному прогнозу wttr.in."
+    )
+)
+async def get_weather_forecast(
+    city: City,
+    days: Annotated[int, Field(ge=1, le=3, description="Число дней прогноза, от 1 до 3.")],
+    ctx: Context[AppContext, Any],
+) -> WeatherForecastResult:
+    return await ctx.request_context.lifespan_context.weather.get_weather_forecast(city, days)
+
+
+@mcp.tool(
+    description=(
+        "Получить почасовой прогноз погоды для текущего или ближайшего дня в указанном "
+        "пользователем городе."
+    )
+)
+async def get_hourly_weather(city: City, ctx: Context[AppContext, Any]) -> HourlyWeatherResult:
+    return await ctx.request_context.lifespan_context.weather.get_hourly_weather(city)
+
+
+@mcp.tool(
+    description=(
+        "Начать фоновый периодический сбор погоды для указанного пользователем города. Сбор выполняется самим "
         "weather-mcp по расписанию, даже когда чат закрыт. Минимальный интервал 30 секунд; "
         "для демонстрации передайте 60. Повторный вызов для того же города и интервала вернёт "
         "уже активное расписание, а не создаст дубликат."
@@ -208,7 +266,7 @@ async def stop_weather_schedule(
 
 @mcp.tool(
     description=(
-        "Немедленно запросить Open-Meteo и сохранить одно измерение в историю выбранного города. "
+        "Немедленно запросить wttr.in и сохранить одно измерение в историю выбранного города. "
         "Используйте для проверки или дополнения данных, не создаёт расписание."
     )
 )
@@ -221,8 +279,8 @@ async def run_weather_collection_now(
 
 @mcp.tool(
     description=(
-        "Получить агрегированную сводку по ранее сохранённым измерениям погоды города за последние "
-        "minutes минут. Для текущей погоды без истории используйте get_current_weather."
+        "Получить агрегированную статистику по ранее автоматически собранным данным погоды города за "
+        "последние minutes минут. Для текущей погоды без истории используйте get_current_weather."
     )
 )
 async def get_weather_summary(
@@ -249,13 +307,20 @@ def _build_summary(city: str, minutes: int, samples: list[WeatherSample]) -> Wea
             **{"from": None},
             to=None,
             temperature=None,
-            relative_humidity_percent=None,
+            feels_like=None,
+            humidity=None,
+            pressure_hpa=None,
             wind_speed_kmh=None,
+            precipitation_mm=None,
             message="За запрошенный период сохранённых измерений нет.",
         )
     temperatures = [sample.temperature_c for sample in samples]
-    humidities = [sample.relative_humidity_percent for sample in samples]
+    feels_like = [sample.feels_like_c for sample in samples if sample.feels_like_c is not None]
+    humidities = [sample.humidity_percent for sample in samples]
+    pressures = [sample.pressure_hpa for sample in samples if sample.pressure_hpa is not None]
     wind_speeds = [sample.wind_speed_kmh for sample in samples]
+    precipitation = [sample.precipitation_mm for sample in samples if sample.precipitation_mm is not None]
+    conditions = list(dict.fromkeys(sample.condition for sample in samples if sample.condition))
     return WeatherSummary(
         city=city,
         period_minutes=minutes,
@@ -269,8 +334,16 @@ def _build_summary(city: str, minutes: int, samples: list[WeatherSample]) -> Wea
             first=temperatures[0],
             last=temperatures[-1],
         ),
-        relative_humidity_percent=_metrics(humidities),
+        feels_like=_optional_metrics(feels_like),
+        humidity=_metrics(humidities),
+        pressure_hpa=_optional_metrics(pressures),
         wind_speed_kmh=_metrics(wind_speeds),
+        precipitation_mm=(
+            PrecipitationMetrics(total=round(sum(precipitation), 1), max=max(precipitation))
+            if precipitation
+            else None
+        ),
+        conditions=conditions or None,
     )
 
 
@@ -292,8 +365,14 @@ def _sample_result(sample: WeatherSample) -> WeatherSampleResult:
         city=sample.city,
         collected_at=to_timestamp(sample.collected_at),
         temperature_c=sample.temperature_c,
-        relative_humidity_percent=sample.relative_humidity_percent,
+        feels_like_c=sample.feels_like_c,
+        humidity_percent=sample.humidity_percent,
+        pressure_hpa=sample.pressure_hpa,
         wind_speed_kmh=sample.wind_speed_kmh,
+        precipitation_mm=sample.precipitation_mm,
+        cloud_cover_percent=sample.cloud_cover_percent,
+        visibility_km=sample.visibility_km,
+        condition=sample.condition,
     )
 
 
@@ -301,6 +380,10 @@ def _metrics(values: list[float | int]) -> WeatherMetrics:
     return WeatherMetrics(
         min=min(values), max=max(values), avg=round(sum(values) / len(values), 1)
     )
+
+
+def _optional_metrics(values: list[float | int]) -> WeatherMetrics | None:
+    return _metrics(values) if values else None
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)

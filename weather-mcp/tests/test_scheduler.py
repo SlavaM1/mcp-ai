@@ -4,12 +4,13 @@ import tempfile
 import unittest
 from datetime import timedelta
 
+import httpx2
 from mcp.server.mcpserver.exceptions import ToolError
 
 from weather_mcp.persistence import WeatherRepository, WeatherSample, WeatherSchedule, utc_now
 from weather_mcp.scheduler import WeatherScheduler
 from weather_mcp.server import _build_summary
-from weather_mcp.weather import WeatherResult
+from weather_mcp.weather import ResolvedLocation, WeatherResult, WeatherService, WttrWeatherClient
 
 
 class FakeWeatherService:
@@ -22,18 +23,21 @@ class FakeWeatherService:
         if self.error:
             raise self.error
         return WeatherResult(
+            requested_city=city,
+            resolved_location=ResolvedLocation(city=city, country="Россия", latitude="55.0", longitude="82.0"),
             city=city,
             country="Россия",
-            latitude=55.0,
-            longitude=82.0,
-            temperature=12.4,
-            apparentTemperature=11.2,
-            relativeHumidity=71,
-            windSpeed=8.6,
-            weatherCode=0,
-            weatherDescription="Ясно",
-            observedAt="2026-09-24T15:30:00Z",
-            timezone="UTC",
+            latitude="55.0",
+            longitude="82.0",
+            temperature_c=12.4,
+            feels_like_c=11.2,
+            humidity_percent=71,
+            pressure_hpa=1012,
+            wind_speed_kmh=8.6,
+            precipitation_mm=0.3,
+            cloud_cover_percent=30,
+            visibility_km=10,
+            condition="Ясно",
         )
 
 
@@ -108,7 +112,37 @@ class WeatherSchedulerTests(unittest.IsolatedAsyncioTestCase):
         summary = _build_summary("Новосибирск", 60, samples)
         self.assertEqual(summary.samples, 1)
         self.assertEqual(summary.temperature.first, 12.4)  # type: ignore[union-attr]
-        self.assertEqual(summary.relative_humidity_percent.avg, 71)  # type: ignore[union-attr]
+        self.assertEqual(summary.humidity.avg, 71)  # type: ignore[union-attr]
+        self.assertEqual(summary.pressure_hpa.avg, 1012)  # type: ignore[union-attr]
+
+    async def test_collection_uses_normalized_wttr_provider_data(self) -> None:
+        payload = {
+            "current_condition": [
+                {
+                    "temp_C": "10",
+                    "FeelsLikeC": "8",
+                    "humidity": "70",
+                    "pressure": "1010",
+                    "windspeedKmph": "12",
+                    "precipMM": "0.2",
+                    "cloudcover": "80",
+                    "visibility": "9",
+                    "weatherDesc": [{"value": "Cloudy"}],
+                }
+            ]
+        }
+        async with httpx2.AsyncClient(
+            transport=httpx2.MockTransport(lambda request: httpx2.Response(200, json=payload)), trust_env=False
+        ) as client:
+            scheduler = WeatherScheduler(
+                self.repository, WeatherService(WttrWeatherClient(client, "https://wttr.in"))
+            )
+            sample = await scheduler.collect_now("Новосибирск")
+
+        self.assertEqual(sample.temperature_c, 10)
+        self.assertEqual(sample.feels_like_c, 8)
+        self.assertEqual(sample.pressure_hpa, 1010)
+        self.assertEqual(sample.condition, "Cloudy")
 
     async def test_summary_without_samples_is_structured(self) -> None:
         summary = _build_summary("Новосибирск", 60, [])
@@ -118,7 +152,7 @@ class WeatherSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_background_provider_error_keeps_schedule_active(self) -> None:
         schedule, _ = self.scheduler.create_schedule("Новосибирск", 60)
-        self.weather.error = ToolError("Open-Meteo временно недоступен.")
+        self.weather.error = ToolError("wttr.in временно недоступен.")
 
         await self.scheduler._run_schedule(schedule.schedule_id)
 
@@ -128,14 +162,21 @@ class WeatherSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_summary_aggregates_persisted_samples(self) -> None:
         now = utc_now()
-        for offset, temperature, humidity, wind in ((2, 10.0, 65, 3.2), (1, 13.0, 75, 12.4)):
+        for offset, temperature, feels_like, humidity, pressure, wind, precipitation in (
+            (2, 10.0, 8.0, 65, 1008, 3.2, 0.8),
+            (1, 13.0, 11.0, 75, 1014, 12.4, 0.9),
+        ):
             self.repository.save_sample(
                 WeatherSample(
                     city="Новосибирск",
                     collected_at=now - timedelta(minutes=offset),
                     temperature_c=temperature,
-                    relative_humidity_percent=humidity,
+                    humidity_percent=humidity,
                     wind_speed_kmh=wind,
+                    feels_like_c=feels_like,
+                    pressure_hpa=pressure,
+                    precipitation_mm=precipitation,
+                    condition="Cloudy",
                 )
             )
 
@@ -149,3 +190,7 @@ class WeatherSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.temperature.avg, 11.5)  # type: ignore[union-attr]
         self.assertEqual(summary.temperature.first, 10.0)  # type: ignore[union-attr]
         self.assertEqual(summary.temperature.last, 13.0)  # type: ignore[union-attr]
+        self.assertEqual(summary.feels_like.avg, 9.5)  # type: ignore[union-attr]
+        self.assertEqual(summary.humidity.avg, 70)  # type: ignore[union-attr]
+        self.assertEqual(summary.pressure_hpa.avg, 1011)  # type: ignore[union-attr]
+        self.assertEqual(summary.precipitation_mm.total, 1.7)  # type: ignore[union-attr]

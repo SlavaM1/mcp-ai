@@ -1,224 +1,356 @@
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Annotated
+import math
+from typing import Any
+from urllib.parse import quote
 
 import httpx2
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-
-CITY_NOT_FOUND = "Город не найден. Проверьте название и попробуйте снова."
-PROVIDER_TIMEOUT = "Open-Meteo не ответил за отведённое время."
-PROVIDER_UNAVAILABLE = "Open-Meteo временно недоступен."
-INVALID_RESPONSE = "Open-Meteo вернул некорректный ответ."
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
-WEATHER_DESCRIPTIONS_RU = {
-    0: "Ясно",
-    1: "Преимущественно ясно",
-    2: "Переменная облачность",
-    3: "Пасмурно",
-    45: "Туман",
-    48: "Туман с отложением изморози",
-    51: "Слабая морось",
-    53: "Умеренная морось",
-    55: "Сильная морось",
-    56: "Слабая ледяная морось",
-    57: "Сильная ледяная морось",
-    61: "Небольшой дождь",
-    63: "Умеренный дождь",
-    65: "Сильный дождь",
-    66: "Слабый ледяной дождь",
-    67: "Сильный ледяной дождь",
-    71: "Небольшой снег",
-    73: "Умеренный снег",
-    75: "Сильный снег",
-    77: "Снежные зерна",
-    80: "Небольшой ливень",
-    81: "Умеренный ливень",
-    82: "Сильный ливень",
-    85: "Небольшой снегопад",
-    86: "Сильный снегопад",
-    95: "Гроза",
-    96: "Гроза со слабым градом",
-    99: "Гроза с сильным градом",
+CITY_NOT_FOUND = "CITY_NOT_FOUND"
+PROVIDER_TIMEOUT = "WEATHER_PROVIDER_TIMEOUT"
+PROVIDER_UNAVAILABLE = "WEATHER_PROVIDER_UNAVAILABLE"
+INVALID_RESPONSE = "WEATHER_PROVIDER_INVALID_RESPONSE"
+
+_ERROR_MESSAGES = {
+    CITY_NOT_FOUND: "Город не найден. Проверьте название и попробуйте снова.",
+    PROVIDER_TIMEOUT: "wttr.in не ответил за отведённое время.",
+    PROVIDER_UNAVAILABLE: "wttr.in временно недоступен.",
+    INVALID_RESPONSE: "wttr.in вернул некорректный ответ.",
 }
 
 
-class _ProviderModel(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True, allow_inf_nan=False)
-
-
-class _Location(_ProviderModel):
-    name: Annotated[str, Field(min_length=1)]
-    country: Annotated[str, Field(min_length=1)]
-    latitude: Annotated[float, Field(ge=-90, le=90)]
-    longitude: Annotated[float, Field(ge=-180, le=180)]
-
-
-class _GeocodingResponse(_ProviderModel):
-    generationtime_ms: float
-    results: list[_Location] = Field(default_factory=list)
-
-
-class _CurrentWeather(_ProviderModel):
-    time: Annotated[datetime, Field(strict=False)]
-    temperature_2m: float
-    apparent_temperature: float
-    relative_humidity_2m: Annotated[int, Field(ge=0, le=100)]
-    wind_speed_10m: Annotated[float, Field(ge=0)]
-    weather_code: Annotated[int, Field(ge=0)]
-
-
-class _ForecastResponse(_ProviderModel):
-    timezone: Annotated[str, Field(min_length=1)]
-    utc_offset_seconds: Annotated[int, Field(gt=-86400, lt=86400)]
-    current: _CurrentWeather
+class ResolvedLocation(BaseModel):
+    city: str
+    region: str | None = None
+    country: str | None = None
+    latitude: str | None = None
+    longitude: str | None = None
 
 
 class WeatherResult(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(serialize_by_alias=True)
 
+    requested_city: str
+    resolved_location: ResolvedLocation
     city: str
-    country: str
-    latitude: float
-    longitude: float
-    temperature: float = Field(description="Текущая температура, °C")
-    apparent_temperature: float = Field(alias="apparentTemperature", description="Ощущаемая температура, °C")
-    relative_humidity: int = Field(alias="relativeHumidity", description="Относительная влажность, %")
-    wind_speed: float = Field(alias="windSpeed", description="Скорость ветра, км/ч")
-    weather_code: int = Field(alias="weatherCode")
-    weather_description: str = Field(alias="weatherDescription")
-    observed_at: str = Field(alias="observedAt")
-    timezone: str
+    country: str | None = None
+    temperature_c: float
+    feels_like_c: float | None = None
+    condition: str | None = None
+    humidity_percent: int
+    pressure_hpa: int | None = None
+    wind_speed_kmh: float
+    wind_direction: str | None = None
+    wind_direction_degrees: int | None = None
+    precipitation_mm: float | None = None
+    cloud_cover_percent: int | None = None
+    visibility_km: float | None = None
+    uv_index: int | None = None
+    observation_time: str | None = None
+    latitude: str | None = None
+    longitude: str | None = None
 
 
-class WeatherService:
-    def __init__(self, client: httpx2.AsyncClient) -> None:
+class ForecastDay(BaseModel):
+    date: str
+    min_temperature_c: float
+    max_temperature_c: float
+    avg_temperature_c: float
+    sunrise: str | None = None
+    sunset: str | None = None
+    moon_phase: str | None = None
+
+
+class WeatherForecastResult(BaseModel):
+    requested_city: str
+    resolved_location: ResolvedLocation
+    city: str
+    forecast: list[ForecastDay]
+
+
+class HourlyWeather(BaseModel):
+    time: str
+    temperature_c: float
+    feels_like_c: float | None = None
+    condition: str | None = None
+    humidity_percent: int
+    precipitation_mm: float | None = None
+    chance_of_rain_percent: int | None = None
+    wind_speed_kmh: float
+    wind_direction: str | None = None
+
+
+class HourlyWeatherResult(BaseModel):
+    requested_city: str
+    resolved_location: ResolvedLocation
+    city: str
+    date: str
+    hours: list[HourlyWeather]
+
+
+class WttrWeatherClient:
+    """Fetches wttr.in JSON without exposing provider-specific failures to MCP tools."""
+
+    def __init__(self, client: httpx2.AsyncClient, base_url: str) -> None:
         self._client = client
+        self._base_url = base_url.rstrip("/")
 
-    async def get_current_weather(self, city: str) -> WeatherResult:
-        geocoding_data = await self._request_json(
-            GEOCODING_URL,
-            params={"name": city, "count": 1, "language": "ru", "format": "json"},
-            provider_endpoint="geocoding",
-        )
+    async def get_weather(self, city: str) -> dict[str, Any]:
+        if not city.strip():
+            raise _tool_error(CITY_NOT_FOUND)
+        url = f"{self._base_url}/{quote(city, safe='')}"
         try:
-            locations = _GeocodingResponse.model_validate(geocoding_data).results
-        except ValidationError as exc:
-            self._invalid_response("geocoding", exc)
-
-        if not locations:
-            logger.info(
-                "City was not found by weather provider",
-                extra={"event": "weather_request_failed", "provider": "open-meteo", "error_category": "not_found"},
-            )
-            raise ToolError(CITY_NOT_FOUND)
-
-        location = locations[0]
-        forecast_data = await self._request_json(
-            FORECAST_URL,
-            params={
-                "latitude": location.latitude,
-                "longitude": location.longitude,
-                "current": ",".join(
-                    (
-                        "temperature_2m",
-                        "apparent_temperature",
-                        "relative_humidity_2m",
-                        "wind_speed_10m",
-                        "weather_code",
-                    )
-                ),
-                "timezone": "auto",
-                "wind_speed_unit": "kmh",
-            },
-            provider_endpoint="forecast",
-        )
-        try:
-            forecast = _ForecastResponse.model_validate(forecast_data)
-            observed_at = forecast.current.time
-            if observed_at.tzinfo is None:
-                observed_at = observed_at.replace(
-                    tzinfo=timezone(timedelta(seconds=forecast.utc_offset_seconds))
-                )
-        except (ValidationError, ValueError, OverflowError) as exc:
-            self._invalid_response("forecast", exc)
-
-        current = forecast.current
-        logger.info(
-            "Weather request completed",
-            extra={"event": "weather_request_succeeded", "provider": "open-meteo"},
-        )
-        return WeatherResult(
-            city=location.name,
-            country=location.country,
-            latitude=location.latitude,
-            longitude=location.longitude,
-            temperature=current.temperature_2m,
-            apparent_temperature=current.apparent_temperature,
-            relative_humidity=current.relative_humidity_2m,
-            wind_speed=current.wind_speed_10m,
-            weather_code=current.weather_code,
-            weather_description=WEATHER_DESCRIPTIONS_RU.get(
-                current.weather_code, "Неизвестные погодные условия"
-            ),
-            observed_at=observed_at.isoformat(),
-            timezone=forecast.timezone,
-        )
-
-    async def _request_json(
-        self,
-        url: str,
-        *,
-        params: dict[str, Any],
-        provider_endpoint: str,
-    ) -> Any:
-        try:
-            response = await self._client.get(url, params=params)
+            response = await self._client.get(url, params={"format": "j1"})
             response.raise_for_status()
         except httpx2.TimeoutException as exc:
             logger.warning(
                 "Weather provider request timed out",
-                extra={"event": "weather_provider_error", "provider": "open-meteo", "error_category": "timeout"},
+                extra={"event": "weather_provider_error", "provider": "wttr.in", "error_category": "timeout"},
             )
-            raise ToolError(PROVIDER_TIMEOUT) from exc
+            raise _tool_error(PROVIDER_TIMEOUT) from exc
         except httpx2.HTTPStatusError as exc:
             logger.warning(
                 "Weather provider returned an error status",
                 extra={
                     "event": "weather_provider_error",
-                    "provider": "open-meteo",
+                    "provider": "wttr.in",
                     "error_category": "unavailable",
                     "status_code": exc.response.status_code,
                 },
             )
-            raise ToolError(PROVIDER_UNAVAILABLE) from exc
+            raise _tool_error(PROVIDER_UNAVAILABLE) from exc
         except httpx2.RequestError as exc:
             logger.warning(
                 "Weather provider request failed",
-                extra={"event": "weather_provider_error", "provider": "open-meteo", "error_category": "unavailable"},
+                extra={"event": "weather_provider_error", "provider": "wttr.in", "error_category": "unavailable"},
             )
-            raise ToolError(PROVIDER_UNAVAILABLE) from exc
+            raise _tool_error(PROVIDER_UNAVAILABLE) from exc
 
         try:
-            return response.json()
+            payload = response.json()
         except ValueError as exc:
-            self._invalid_response(provider_endpoint, exc)
+            raise _tool_error(INVALID_RESPONSE) from exc
+        if not isinstance(payload, dict):
+            raise _tool_error(INVALID_RESPONSE)
+        if _provider_reports_unknown_city(payload):
+            raise _tool_error(CITY_NOT_FOUND)
+        return payload
 
-    @staticmethod
-    def _invalid_response(provider_endpoint: str, exc: Exception) -> None:
-        logger.warning(
-            "Weather provider returned an invalid response",
-            extra={
-                "event": "weather_provider_error",
-                "provider": "open-meteo",
-                "error_category": "invalid_response",
-            },
+
+class WeatherService:
+    """Normalizes wttr.in responses for MCP tools and background collection."""
+
+    def __init__(self, client: WttrWeatherClient) -> None:
+        self._client = client
+
+    async def get_current_weather(self, city: str) -> WeatherResult:
+        payload = await self._client.get_weather(city)
+        current = _first_dict(payload.get("current_condition"))
+        if current is None:
+            raise _tool_error(INVALID_RESPONSE)
+        location = _location(payload, city)
+        try:
+            result = WeatherResult(
+                requested_city=city,
+                resolved_location=location,
+                city=location.city,
+                country=location.country,
+                temperature_c=_required_number(current, "temp_C"),
+                feels_like_c=_optional_number(current, "FeelsLikeC"),
+                condition=_text_value(current.get("weatherDesc")),
+                humidity_percent=_required_int(current, "humidity"),
+                pressure_hpa=_optional_int(current, "pressure"),
+                wind_speed_kmh=_required_number(current, "windspeedKmph"),
+                wind_direction=_optional_text(current.get("winddir16Point")),
+                wind_direction_degrees=_optional_int(current, "winddirDegree"),
+                precipitation_mm=_optional_number(current, "precipMM"),
+                cloud_cover_percent=_optional_int(current, "cloudcover"),
+                visibility_km=_optional_number(current, "visibility"),
+                uv_index=_optional_int(current, "uvIndex"),
+                observation_time=_optional_text(current.get("localObsDateTime")),
+                latitude=location.latitude,
+                longitude=location.longitude,
+            )
+        except (TypeError, ValueError) as exc:
+            raise _tool_error(INVALID_RESPONSE) from exc
+        logger.info("Weather request completed", extra={"event": "weather_request_succeeded", "provider": "wttr.in"})
+        return result
+
+    async def get_weather_forecast(self, city: str, days: int) -> WeatherForecastResult:
+        payload = await self._client.get_weather(city)
+        weather = payload.get("weather")
+        if not isinstance(weather, list) or not weather:
+            raise _tool_error(INVALID_RESPONSE)
+        location = _location(payload, city)
+        forecast: list[ForecastDay] = []
+        try:
+            for item in weather[:days]:
+                if not isinstance(item, dict):
+                    raise ValueError("weather item is not an object")
+                astronomy = _first_dict(item.get("astronomy")) or {}
+                forecast.append(
+                    ForecastDay(
+                        date=_required_text(item, "date"),
+                        min_temperature_c=_required_number(item, "mintempC"),
+                        max_temperature_c=_required_number(item, "maxtempC"),
+                        avg_temperature_c=_required_number(item, "avgtempC"),
+                        sunrise=_optional_text(astronomy.get("sunrise")),
+                        sunset=_optional_text(astronomy.get("sunset")),
+                        moon_phase=_optional_text(astronomy.get("moon_phase")),
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            raise _tool_error(INVALID_RESPONSE) from exc
+        if not forecast:
+            raise _tool_error(INVALID_RESPONSE)
+        return WeatherForecastResult(
+            requested_city=city,
+            resolved_location=location,
+            city=location.city,
+            forecast=forecast,
         )
-        raise ToolError(INVALID_RESPONSE) from exc
+
+    async def get_hourly_weather(self, city: str) -> HourlyWeatherResult:
+        payload = await self._client.get_weather(city)
+        weather = payload.get("weather")
+        if not isinstance(weather, list) or not weather or not isinstance(weather[0], dict):
+            raise _tool_error(INVALID_RESPONSE)
+        day = weather[0]
+        hourly = day.get("hourly")
+        if not isinstance(hourly, list) or not hourly:
+            raise _tool_error(INVALID_RESPONSE)
+        location = _location(payload, city)
+        try:
+            hours: list[HourlyWeather] = []
+            for item in hourly:
+                if not isinstance(item, dict):
+                    raise ValueError("hourly item is not an object")
+                hours.append(
+                    HourlyWeather(
+                        time=_format_hour(_required_text(item, "time")),
+                        temperature_c=_required_number(item, "tempC"),
+                        feels_like_c=_optional_number(item, "FeelsLikeC"),
+                        condition=_text_value(item.get("weatherDesc")),
+                        humidity_percent=_required_int(item, "humidity"),
+                        precipitation_mm=_optional_number(item, "precipMM"),
+                        chance_of_rain_percent=_optional_int(item, "chanceofrain"),
+                        wind_speed_kmh=_required_number(item, "windspeedKmph"),
+                        wind_direction=_optional_text(item.get("winddir16Point")),
+                    )
+                )
+            date = _required_text(day, "date")
+        except (TypeError, ValueError) as exc:
+            raise _tool_error(INVALID_RESPONSE) from exc
+        if not hours:
+            raise _tool_error(INVALID_RESPONSE)
+        return HourlyWeatherResult(
+            requested_city=city,
+            resolved_location=location,
+            city=location.city,
+            date=date,
+            hours=hours,
+        )
+
+
+def _location(payload: dict[str, Any], requested_city: str) -> ResolvedLocation:
+    area = _first_dict(payload.get("nearest_area")) or {}
+    return ResolvedLocation(
+        city=_text_value(area.get("areaName")) or requested_city,
+        region=_text_value(area.get("region")),
+        country=_text_value(area.get("country")),
+        latitude=_optional_text(area.get("latitude")),
+        longitude=_optional_text(area.get("longitude")),
+    )
+
+
+def _provider_reports_unknown_city(payload: dict[str, Any]) -> bool:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    errors = data.get("error")
+    if not isinstance(errors, list):
+        return False
+    return any(_text_value(item.get("msg")) for item in errors if isinstance(item, dict))
+
+
+def _first_dict(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return value[0]
+    return None
+
+
+def _text_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):
+        first = _first_dict(value)
+        if first is not None:
+            return _optional_text(first.get("value"))
+    return None
+
+
+def _optional_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _required_text(payload: dict[str, Any], field: str) -> str:
+    value = _optional_text(payload.get(field))
+    if value is None:
+        raise ValueError(f"missing {field}")
+    return value
+
+
+def _optional_number(payload: dict[str, Any], field: str) -> float | None:
+    value = payload.get(field)
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid {field}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {field}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"invalid {field}")
+    return number
+
+
+def _required_number(payload: dict[str, Any], field: str) -> float:
+    value = _optional_number(payload, field)
+    if value is None:
+        raise ValueError(f"missing {field}")
+    return value
+
+
+def _optional_int(payload: dict[str, Any], field: str) -> int | None:
+    value = _optional_number(payload, field)
+    if value is None:
+        return None
+    if not value.is_integer():
+        raise ValueError(f"invalid {field}")
+    return int(value)
+
+
+def _required_int(payload: dict[str, Any], field: str) -> int:
+    value = _optional_int(payload, field)
+    if value is None:
+        raise ValueError(f"missing {field}")
+    return value
+
+
+def _format_hour(value: str) -> str:
+    if value.isdigit() and 0 <= int(value) <= 2359:
+        padded = value.zfill(4)
+        if int(padded[:2]) <= 23 and int(padded[2:]) <= 59:
+            return f"{padded[:2]}:{padded[2:]}"
+    return value
+
+
+def _tool_error(code: str) -> ToolError:
+    return ToolError(json.dumps({"error": code, "message": _ERROR_MESSAGES[code]}, ensure_ascii=False))

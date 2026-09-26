@@ -36,8 +36,14 @@ class WeatherSample:
     city: str
     collected_at: datetime
     temperature_c: float
-    relative_humidity_percent: int
+    humidity_percent: int
     wind_speed_kmh: float
+    feels_like_c: float | None = None
+    pressure_hpa: int | None = None
+    precipitation_mm: float | None = None
+    cloud_cover_percent: int | None = None
+    visibility_km: float | None = None
+    condition: str | None = None
 
 
 class WeatherRepository:
@@ -73,13 +79,44 @@ class WeatherRepository:
                 collected_at TEXT NOT NULL,
                 temperature_c REAL NOT NULL,
                 relative_humidity_percent INTEGER NOT NULL,
-                wind_speed_kmh REAL NOT NULL
+                wind_speed_kmh REAL NOT NULL,
+                feels_like_c REAL,
+                humidity_percent INTEGER,
+                pressure_hpa INTEGER,
+                precipitation_mm REAL,
+                cloud_cover_percent INTEGER,
+                visibility_km REAL,
+                condition TEXT
             );
             CREATE INDEX IF NOT EXISTS weather_samples_by_city_collected_at
             ON weather_samples(city, collected_at);
             """
         )
+        self._migrate_weather_samples()
         self._connection.commit()
+
+    def _migrate_weather_samples(self) -> None:
+        """Add nullable measurements while retaining existing schedule history."""
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(weather_samples)")
+        }
+        additions = {
+            "feels_like_c": "REAL",
+            "humidity_percent": "INTEGER",
+            "pressure_hpa": "INTEGER",
+            "precipitation_mm": "REAL",
+            "cloud_cover_percent": "INTEGER",
+            "visibility_km": "REAL",
+            "condition": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                self._connection.execute(f"ALTER TABLE weather_samples ADD COLUMN {name} {column_type}")
+        self._connection.execute(
+            """UPDATE weather_samples SET humidity_percent = relative_humidity_percent
+            WHERE humidity_percent IS NULL"""
+        )
 
     def create_schedule(self, schedule: WeatherSchedule) -> tuple[WeatherSchedule, bool]:
         existing = self._connection.execute(
@@ -148,14 +185,23 @@ class WeatherRepository:
     def save_sample(self, sample: WeatherSample) -> WeatherSample:
         self._connection.execute(
             """INSERT INTO weather_samples (
-                city, collected_at, temperature_c, relative_humidity_percent, wind_speed_kmh
-            ) VALUES (?, ?, ?, ?, ?)""",
+                city, collected_at, temperature_c, relative_humidity_percent, wind_speed_kmh,
+                feels_like_c, humidity_percent, pressure_hpa, precipitation_mm,
+                cloud_cover_percent, visibility_km, condition
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sample.city,
                 to_timestamp(sample.collected_at),
                 sample.temperature_c,
-                sample.relative_humidity_percent,
+                sample.humidity_percent,
                 sample.wind_speed_kmh,
+                sample.feels_like_c,
+                sample.humidity_percent,
+                sample.pressure_hpa,
+                sample.precipitation_mm,
+                sample.cloud_cover_percent,
+                sample.visibility_km,
+                sample.condition,
             ),
         )
         self._connection.commit()
@@ -163,7 +209,10 @@ class WeatherRepository:
 
     def samples_since(self, city: str, since: datetime, until: datetime) -> list[WeatherSample]:
         rows = self._connection.execute(
-            """SELECT city, collected_at, temperature_c, relative_humidity_percent, wind_speed_kmh
+            """SELECT city, collected_at, temperature_c,
+            COALESCE(humidity_percent, relative_humidity_percent) AS humidity_percent,
+            wind_speed_kmh, feels_like_c, pressure_hpa, precipitation_mm, cloud_cover_percent,
+            visibility_km, condition
             FROM weather_samples WHERE city = ? AND collected_at >= ? AND collected_at <= ?
             ORDER BY collected_at ASC""",
             (city, to_timestamp(since), to_timestamp(until)),
@@ -173,8 +222,14 @@ class WeatherRepository:
                 city=row["city"],
                 collected_at=from_timestamp(row["collected_at"]),
                 temperature_c=row["temperature_c"],
-                relative_humidity_percent=row["relative_humidity_percent"],
+                humidity_percent=row["humidity_percent"],
                 wind_speed_kmh=row["wind_speed_kmh"],
+                feels_like_c=row["feels_like_c"],
+                pressure_hpa=row["pressure_hpa"],
+                precipitation_mm=row["precipitation_mm"],
+                cloud_cover_percent=row["cloud_cover_percent"],
+                visibility_km=row["visibility_km"],
+                condition=row["condition"],
             )
             for row in rows
         ]
