@@ -21,9 +21,19 @@
 }
 .status-light { width: 9px; height: 9px; border-radius: 50%; background: #aab2bf; box-shadow: 0 0 0 4px rgba(170, 178, 191, 0.14); }
 .server-strip-online .status-light { background: var(--success); box-shadow: 0 0 0 4px rgba(21, 132, 102, 0.14); }
-.server-strip div { min-width: 0; display: grid; gap: 1px; }
+.server-strip-partial .status-light { background: #c88719; box-shadow: 0 0 0 4px rgba(200, 135, 25, 0.14); }
+.server-strip-unavailable .status-light { background: var(--danger); box-shadow: 0 0 0 4px rgba(190, 72, 61, 0.14); }
+.server-details { min-width: 0; display: flex; align-items: center; gap: 9px; }
+.server-primary { min-width: 0; display: grid; gap: 1px; }
 .server-strip strong { font-size: 11px; }
-.server-strip small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.server-primary small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.server-statuses { min-width: 0; display: flex; align-items: center; gap: 4px; overflow-x: auto; }
+.server-status { padding: 3px 5px; display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; color: #78615e; background: #f7e9e7; font-size: 8px; font-weight: 720; white-space: nowrap; }
+.server-status i { width: 5px; height: 5px; border-radius: 50%; background: var(--danger); }
+.server-status b { color: #887572; font-size: 8px; }
+.server-status-ok { color: #286e5c; background: #e3f2ed; }
+.server-status-ok i { background: var(--success); }
+.server-status-ok b { color: #4b806f; }
 .tool-count { padding: 4px 7px; border-radius: 7px; color: #584396; background: #ece7f8; font-size: 9px; font-weight: 750; }
 .refresh-button { justify-self: end; min-height: 38px; padding: 0 13px; border: 1px solid var(--line); border-radius: 11px; color: var(--muted); background: white; font-size: 11px; font-weight: 700; }
 
@@ -82,6 +92,10 @@
 .tool-call-heading { display: flex; align-items: center; gap: 8px; }
 .tool-call-heading h3 { min-width: 0; margin: 0; color: #27344a; font: 700 12px "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
 .tool-call-heading time { margin-left: auto; color: #7e899b; font: 9px "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+.tool-route { min-width: 0; margin: 7px 0 0 36px; display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; color: #66748a; font-size: 9px; }
+.tool-route span { white-space: nowrap; }
+.tool-route b, .tool-route code { color: #4d5f7b; font: 700 9px "SFMono-Regular", Consolas, monospace; }
+.tool-route small { min-width: 0; overflow: hidden; color: #8993a2; font: 9px "SFMono-Regular", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .tool-call-data { margin-top: 10px; display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); gap: 8px; }
 .tool-call-data > div { min-width: 0; }
 .tool-call-data span { display: block; margin-bottom: 5px; color: #7a8495; font-size: 9px; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -96,6 +110,7 @@
 .tool-card-heading { display: flex; align-items: center; gap: 9px; }
 .tool-glyph { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: #5d489b; background: #ede8f8; font: 700 9px "SFMono-Regular", Consolas, monospace; }
 .tool-card h3 { margin: 0; color: #27344a; font: 700 13px "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.tool-card .tool-route { margin-left: 37px; }
 .tool-card > p { margin: 10px 0 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .tool-card details { border-top: 1px solid #e7eaf0; }
 .tool-card summary { padding-top: 10px; color: #5b6680; font-size: 10px; font-weight: 730; cursor: pointer; }
@@ -130,6 +145,8 @@
   .topbar { grid-template-columns: auto 1fr; gap: 10px; }
   .brand > span:last-child { display: none; }
   .server-strip { grid-column: 1 / -1; grid-row: 2; }
+  .server-details { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .server-statuses { max-width: 100%; }
   .refresh-button { grid-column: 2; grid-row: 1; }
   .sidebar, .sidebar-collapsed { grid-template-columns: 36px 112px minmax(0, 1fr); }
   .chat { width: min(100% - 28px, 930px); padding-top: 28px; }

@@ -14,8 +14,8 @@ from .llm_client import OpenAICompatibleClient
 from .mcp_client import (
     MCPClientError,
     MCPInvalidResponseError,
+    MCPRegistry,
     MCPTimeoutError,
-    MCPToolsClient,
 )
 from .models import ChatMessage, ChatSession, MessageRole
 from .schemas import (
@@ -42,8 +42,12 @@ app.add_middleware(
 )
 
 
-def get_mcp_client() -> MCPToolsClient:
-    return MCPToolsClient(settings.mcp_server_url, settings.mcp_timeout_seconds)
+def get_mcp_registry() -> MCPRegistry:
+    return MCPRegistry(settings.configured_mcp_servers, settings.mcp_timeout_seconds)
+
+
+# Preserve old dependency overrides while API code uses the registry explicitly.
+get_mcp_client = get_mcp_registry
 
 
 def get_llm_client() -> OpenAICompatibleClient:
@@ -170,16 +174,25 @@ def get_session(session_id: uuid.UUID, db: Session = Depends(get_db)) -> Session
 
 
 @app.get("/api/mcp/status", response_model=MCPStatus)
-async def mcp_status(client: MCPToolsClient = Depends(get_mcp_client)) -> MCPStatus:
+async def mcp_status(registry: MCPRegistry = Depends(get_mcp_registry)) -> MCPStatus:
     try:
-        tools = await client.list_tools()
+        tools = await registry.list_tools()
         return MCPStatus(
-            connected=True,
-            server_url=client.server_url,
+            connected=registry.connected,
+            status=registry.status,
+            server_url=registry.server_url,
             tool_count=len(tools),
+            servers=registry.servers,
         )
     except MCPClientError as exc:
-        return MCPStatus(connected=False, server_url=client.server_url, error=str(exc))
+        return MCPStatus(
+            connected=False,
+            status="unavailable",
+            server_url=registry.server_url,
+            tool_count=0,
+            servers=getattr(exc, "servers", None) or registry.servers,
+            error=str(exc),
+        )
 
 
 @app.post("/api/sessions/{session_id}/messages", response_model=AgentMessageResponse)
@@ -187,19 +200,20 @@ async def send_agent_message(
     session_id: uuid.UUID,
     payload: AgentMessageRequest,
     db: Session = Depends(get_db),
-    mcp_client: MCPToolsClient = Depends(get_mcp_client),
+    mcp_registry: MCPRegistry = Depends(get_mcp_registry),
     llm_client: OpenAICompatibleClient = Depends(get_llm_client),
 ) -> AgentMessageResponse:
     chat_session = _load_session(db, session_id)
     user_content = payload.message.strip()
-    agent = ChatAgent(mcp_client, llm_client, settings.max_tool_calls)
+    agent = ChatAgent(mcp_registry, llm_client, settings.max_tool_calls)
     db.commit()
     try:
         result = await agent.run(chat_session.messages, user_content)
     except AgentExecutionError as exc:
         mcp_data = {
             "status": "error",
-            "server_url": mcp_client.server_url,
+            "server_url": mcp_registry.server_url,
+            "servers": exc.servers,
             "error": str(exc),
             "error_category": exc.category,
             "available_tools": exc.tools,
@@ -219,7 +233,8 @@ async def send_agent_message(
     has_tool_error = any(call.get("error") for call in result.tool_calls)
     mcp_data = {
         "status": "tool_error" if has_tool_error else "ok",
-        "server_url": mcp_client.server_url,
+        "server_url": mcp_registry.server_url,
+        "servers": result.servers,
         "available_tools": result.tools,
         "tool_calls": result.tool_calls,
     }
@@ -232,7 +247,8 @@ async def send_agent_message(
     )
     return AgentMessageResponse(
         session=_session_read(saved_session),
-        server_url=mcp_client.server_url,
+        server_url=mcp_registry.server_url,
+        servers=result.servers,
         tool_calls=result.tool_calls,
     )
 
@@ -242,12 +258,12 @@ async def list_mcp_tools(
     session_id: uuid.UUID,
     payload: ToolListRequest,
     db: Session = Depends(get_db),
-    client: MCPToolsClient = Depends(get_mcp_client),
+    registry: MCPRegistry = Depends(get_mcp_registry),
 ) -> ToolListResponse:
     chat_session = _load_session(db, session_id)
     user_content = payload.message.strip()
     try:
-        tools = await client.list_tools()
+        tools = await registry.list_tools()
     except MCPClientError as exc:
         assistant_content = f"Не удалось получить список MCP-инструментов: {exc}"
         _save_exchange(
@@ -255,7 +271,12 @@ async def list_mcp_tools(
             chat_session,
             user_content,
             assistant_content,
-            {"status": "error", "server_url": client.server_url, "error": str(exc)},
+            {
+                "status": "error",
+                "server_url": registry.server_url,
+                "servers": getattr(exc, "servers", None) or registry.servers,
+                "error": str(exc),
+            },
         )
         response_status = 504 if isinstance(exc, MCPTimeoutError) else 502
         if isinstance(exc, MCPInvalidResponseError):
@@ -271,13 +292,20 @@ async def list_mcp_tools(
         chat_session,
         user_content,
         assistant_content,
-        {"status": "ok", "server_url": client.server_url, "tools": tools},
+        {
+            "status": registry.status,
+            "server_url": registry.server_url,
+            "servers": registry.servers,
+            "tools": tools,
+        },
     )
     return ToolListResponse(
         session=_session_read(saved_session),
         tools=tools,
-        server_url=client.server_url,
-        connected=True,
+        server_url=registry.server_url,
+        connected=registry.connected,
+        status=registry.status,
+        servers=registry.servers,
     )
 
 

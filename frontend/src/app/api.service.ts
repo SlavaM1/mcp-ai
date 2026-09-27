@@ -4,6 +4,11 @@ import { firstValueFrom } from 'rxjs';
 
 export interface MCPTool {
   name: string;
+  llm_tool_name?: string | null;
+  original_name?: string | null;
+  tool_name?: string | null;
+  server_name?: string | null;
+  server_url?: string | null;
   description: string | null;
   input_schema: Record<string, unknown> | null;
 }
@@ -12,10 +17,24 @@ export interface MCPToolCall {
   id: string;
   sequence?: number;
   name: string;
+  server_name?: string | null;
+  server_url?: string | null;
+  tool_name?: string | null;
+  llm_tool_name?: string | null;
   arguments: unknown;
   result?: unknown;
   error?: string | null;
   duration_ms?: number | null;
+}
+
+export type MCPAggregateStatus = 'ok' | 'partial' | 'unavailable';
+
+export interface MCPServerStatus {
+  server_name: string;
+  server_url: string;
+  status: 'ok' | 'unavailable';
+  tool_count: number;
+  error: string | null;
 }
 
 export interface ChatMessage {
@@ -25,10 +44,12 @@ export interface ChatMessage {
   content: string;
   mcp_data: {
     status?: string;
-    server_url?: string;
-    error?: string;
+    server_url?: string | null;
+    error?: string | null;
     tools?: MCPTool[];
+    available_tools?: MCPTool[];
     tool_calls?: MCPToolCall[];
+    servers?: MCPServerStatus[];
   } | null;
   created_at: string;
 }
@@ -47,14 +68,17 @@ export interface ChatSession extends ChatSessionSummary {
 
 export interface MCPStatus {
   connected: boolean;
-  server_url: string;
+  status?: MCPAggregateStatus;
+  server_url: string | null;
   tool_count: number | null;
+  servers?: MCPServerStatus[];
   error: string | null;
 }
 
 interface AgentMessageResponse {
   session: ChatSession;
-  server_url: string;
+  server_url: string | null;
+  servers?: MCPServerStatus[];
   tool_calls: MCPToolCall[];
 }
 

@@ -26,14 +26,14 @@ services:
       WEATHER_HTTP_TIMEOUT_SECONDS: ${WEATHER_HTTP_TIMEOUT_SECONDS:-15}
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)",
+          "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8001/health', timeout=3)",
         ]
       interval: 10s
       timeout: 5s
@@ -45,6 +45,86 @@ services:
       - weather_mcp_data:/data
     restart: unless-stopped
 
+  currency-mcp:
+    build:
+      context: currency-mcp
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      CURRENCY_BASE_URL: ${CURRENCY_BASE_URL:-https://open.er-api.com/v6/latest}
+      CURRENCY_HTTP_TIMEOUT_SECONDS: ${CURRENCY_HTTP_TIMEOUT_SECONDS:-10}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8002/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    ports:
+      - "${CURRENCY_MCP_PORT:-8002}:8002"
+    restart: unless-stopped
+
+  travel-mcp:
+    build:
+      context: travel-mcp
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8003/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    ports:
+      - "${TRAVEL_MCP_PORT:-8003}:8003"
+    restart: unless-stopped
+
+  report-mcp:
+    build:
+      context: report-mcp
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      REPORTS_DIRECTORY: /data/reports
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8004/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    ports:
+      - "${REPORT_MCP_PORT:-8004}:8004"
+    volumes:
+      - report_mcp_reports:/data/reports
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -53,16 +133,17 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://mcp_ai:mcp_ai_local@db:5432/mcp_ai}
       MCP_SERVER_URL: ${MCP_SERVER_URL:-http://weather-mcp:8001/mcp}
+      MCP_SERVERS: '${MCP_SERVERS:-{"weather":"http://weather-mcp:8001/mcp","currency":"http://currency-mcp:8002/mcp","travel":"http://travel-mcp:8003/mcp","report":"http://report-mcp:8004/mcp"}}'
       MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
-      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-4}
+      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-12}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:4201}
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
     depends_on:
       db:
         condition: service_healthy
@@ -74,7 +155,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)",
+          "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://localhost:8000/health', timeout=3)",
         ]
       interval: 10s
       timeout: 5s
@@ -93,7 +174,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      test: ["CMD", "wget", "-Y", "off", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -110,12 +191,16 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://mcp_ai:mcp_ai_local@db:5432/mcp_ai}
       MCP_SERVER_URL: ${MCP_SERVER_URL:-http://weather-mcp:8001/mcp}
+      MCP_SERVERS: '${MCP_SERVERS:-{"weather":"http://weather-mcp:8001/mcp","currency":"http://currency-mcp:8002/mcp","travel":"http://travel-mcp:8003/mcp","report":"http://report-mcp:8004/mcp"}}'
       MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
-      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-4}
+      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-12}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
     depends_on:
       db:
         condition: service_healthy
@@ -127,8 +212,46 @@ services:
       dockerfile: Dockerfile
       target: test
 
+  currency-mcp-test:
+    profiles: ["test"]
+    build:
+      context: currency-mcp
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      CURRENCY_BASE_URL: ${CURRENCY_BASE_URL:-https://open.er-api.com/v6/latest}
+      CURRENCY_HTTP_TIMEOUT_SECONDS: ${CURRENCY_HTTP_TIMEOUT_SECONDS:-10}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+
+  travel-mcp-test:
+    profiles: ["test"]
+    build:
+      context: travel-mcp
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+
+  report-mcp-test:
+    profiles: ["test"]
+    build:
+      context: report-mcp
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      REPORTS_DIRECTORY: /data/reports
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1},db,backend,frontend,weather-mcp,currency-mcp,travel-mcp,report-mcp
+
 volumes:
   postgres_data:
     name: mcp-ai-postgres-data
   weather_mcp_data:
     name: mcp-ai-weather-mcp-data
+  report_mcp_reports:
+    name: mcp-ai-report-mcp-reports

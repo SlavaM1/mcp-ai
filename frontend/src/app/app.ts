@@ -1,4 +1,4 @@
-import { DatePipe, JsonPipe } from '@angular/common';
+import { DatePipe, JsonPipe, UpperCasePipe } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { Component, ElementRef, inject, OnInit, signal, ViewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
@@ -7,6 +7,8 @@ import {
   ApiService,
   ChatSession,
   ChatSessionSummary,
+  MCPAggregateStatus,
+  MCPServerStatus,
   MCPStatus,
   MCPTool,
   MCPToolCall,
@@ -14,7 +16,7 @@ import {
 
 @Component({
   selector: 'app-root',
-  imports: [DatePipe, FormsModule, JsonPipe],
+  imports: [DatePipe, FormsModule, JsonPipe, UpperCasePipe],
   templateUrl: './app.html',
   styleUrl: './app.scss',
 })
@@ -100,11 +102,20 @@ export class App implements OnInit {
       const result = await this.api.sendMessage(session.id, message);
       this.activeSession.set(result.session);
       this.draft = '';
+      const servers = result.servers ?? this.status()?.servers;
+      const aggregateStatus = this.aggregateStatusFor(servers);
       this.status.set({
-        connected: true,
+        connected: aggregateStatus ? aggregateStatus !== 'unavailable' : true,
+        status: aggregateStatus ?? this.status()?.status ?? 'ok',
         server_url: result.server_url,
-        tool_count: this.status()?.tool_count ?? null,
-        error: null,
+        tool_count: servers
+          ? servers.reduce((total, server) => total + server.tool_count, 0)
+          : (this.status()?.tool_count ?? null),
+        servers,
+        error:
+          aggregateStatus === 'unavailable'
+            ? (servers?.find(({ error }) => error)?.error ?? null)
+            : null,
       });
       await this.reloadSessionList(session.id);
     } catch (error: unknown) {
@@ -131,8 +142,10 @@ export class App implements OnInit {
     } catch (error: unknown) {
       this.status.set({
         connected: false,
+        status: 'unavailable',
         server_url: 'MCP_SERVER_URL',
         tool_count: null,
+        servers: this.status()?.servers,
         error: this.errorText(error),
       });
     } finally {
@@ -147,12 +160,18 @@ export class App implements OnInit {
     }
   }
 
-  toolsFor(message: { mcp_data: { tools?: MCPTool[] } | null }): MCPTool[] {
-    return message.mcp_data?.tools ?? [];
+  toolsFor(message: {
+    mcp_data: { tools?: MCPTool[]; available_tools?: MCPTool[] } | null;
+  }): MCPTool[] {
+    return message.mcp_data?.tools ?? message.mcp_data?.available_tools ?? [];
   }
 
   toolCallsFor(message: { mcp_data: { tool_calls?: MCPToolCall[] } | null }): MCPToolCall[] {
     return message.mcp_data?.tool_calls ?? [];
+  }
+
+  aggregateStatus(): MCPAggregateStatus {
+    return this.status()?.status ?? (this.status()?.connected ? 'ok' : 'unavailable');
   }
 
   toggleSidebar(): void {
@@ -169,6 +188,13 @@ export class App implements OnInit {
     const summary = summaries.find(({ id }) => id === activeId);
     const current = this.activeSession();
     if (summary && current) this.activeSession.set({ ...current, ...summary });
+  }
+
+  private aggregateStatusFor(servers?: MCPServerStatus[]): MCPAggregateStatus | null {
+    if (!servers?.length) return null;
+    const healthy = servers.filter(({ status }) => status === 'ok').length;
+    if (healthy === servers.length) return 'ok';
+    return healthy > 0 ? 'partial' : 'unavailable';
   }
 
   private errorText(error: unknown): string {

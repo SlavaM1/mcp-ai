@@ -11,19 +11,21 @@ from .llm_client import (
     OpenAICompatibleClient,
 )
 from .logging_utils import log_event
-from .mcp_client import ConnectedMCPTools, MCPClientError, MCPTimeoutError, MCPToolsClient
+from .mcp_client import ConnectedMCPRegistry, MCPClientError, MCPRegistry, MCPTimeoutError
 from .models import ChatMessage, MessageRole
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 SYSTEM_PROMPT = """Ты полезный русскоязычный ассистент. Учитывай историю диалога.
-Доступные инструменты предоставлены MCP-сервером динамически. Сам решай, нужен ли инструмент:
-вызывай его только для получения актуальных или внешних данных, а на обычные вопросы отвечай без
-инструмента. После результата инструмента сформулируй понятный итоговый ответ, не показывай сырой
-JSON. Если задача требует нескольких инструментов, продолжай вызывать подходящие инструменты,
-передавая structured_content результата предыдущего вызова в аргументы следующего, пока задача не
-будет выполнена полностью. Не придумывай данные, которых нет в результате."""
+Доступные инструменты предоставлены несколькими MCP-серверами динамически и имеют имена с
+пространством имён сервера. Сам решай, нужен ли инструмент: вызывай его только для получения
+актуальных или внешних данных, а на обычные вопросы отвечай без инструмента. Если задача зависит от
+нескольких источников или этапов, вызывай инструменты последовательно в порядке зависимостей.
+Используй фактический structured_content результата предыдущего вызова в аргументах следующего,
+в том числе при передаче данных между разными серверами; не подменяй эти данные догадками. После
+всех необходимых вызовов сформулируй понятный итоговый ответ и не показывай сырой JSON. Ошибку
+одного инструмента учитывай как контролируемый результат и по возможности продолжай задачу."""
 
 
 @dataclass
@@ -31,6 +33,7 @@ class AgentResult:
     content: str
     tools: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
+    servers: list[dict[str, Any]]
 
 
 class AgentExecutionError(Exception):
@@ -41,21 +44,23 @@ class AgentExecutionError(Exception):
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        servers: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.tools = tools or []
         self.tool_calls = tool_calls or []
+        self.servers = servers or []
 
 
 class ChatAgent:
     def __init__(
         self,
-        mcp_client: MCPToolsClient,
+        mcp_registry: MCPRegistry,
         llm_client: OpenAICompatibleClient,
         max_tool_calls: int,
     ) -> None:
-        self._mcp_client = mcp_client
+        self._mcp_registry = mcp_registry
         self._llm_client = llm_client
         self._max_tool_calls = max_tool_calls
 
@@ -66,10 +71,12 @@ class ChatAgent:
     ) -> AgentResult:
         tools: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
+        servers: list[dict[str, Any]] = []
         try:
             self._llm_client.ensure_configured()
-            async with self._mcp_client.connect() as mcp_session:
+            async with self._mcp_registry.connect() as mcp_session:
                 tools = await mcp_session.list_tools()
+                servers = mcp_session.servers
                 allowed_tools = {tool["name"]: tool for tool in tools}
                 llm_tools = [self._to_llm_tool(tool) for tool in tools]
                 messages = [
@@ -81,6 +88,24 @@ class ChatAgent:
                     ],
                     {"role": "user", "content": user_content},
                 ]
+                unavailable = [
+                    item["server_name"]
+                    for item in servers
+                    if item.get("status") == "unavailable"
+                ]
+                if unavailable:
+                    messages.insert(
+                        1,
+                        {
+                            "role": "system",
+                            "content": (
+                                "Сейчас недоступны MCP-серверы: "
+                                + ", ".join(unavailable)
+                                + ". Если запрос требует их инструментов, явно сообщи пользователю "
+                                "об ограничении; не имитируй отсутствующие результаты."
+                            ),
+                        },
+                    )
 
                 while True:
                     assistant = await self._llm_client.complete(messages, llm_tools)
@@ -94,7 +119,12 @@ class ChatAgent:
                                 tools=tools,
                                 tool_calls=calls,
                             )
-                        return AgentResult(content=content.strip(), tools=tools, tool_calls=calls)
+                        return AgentResult(
+                            content=content.strip(),
+                            tools=tools,
+                            tool_calls=calls,
+                            servers=mcp_session.servers,
+                        )
 
                     normalized_calls = [self._normalize_tool_call(item) for item in requested_calls]
                     if len(calls) + len(normalized_calls) > self._max_tool_calls:
@@ -126,11 +156,14 @@ class ChatAgent:
                         call_record["sequence"] = len(calls) + 1
                         calls.append(call_record)
                         messages.append(tool_message)
+                        servers = mcp_session.servers
         except AgentExecutionError as exc:
             if not exc.tools:
                 exc.tools = tools
             if not exc.tool_calls:
                 exc.tool_calls = calls
+            if not exc.servers:
+                exc.servers = servers
             raise
         except LLMConfigurationError as exc:
             raise AgentExecutionError(
@@ -138,6 +171,7 @@ class ChatAgent:
                 "llm_configuration",
                 tools=tools,
                 tool_calls=calls,
+                servers=servers,
             ) from exc
         except LLMInvalidResponseError as exc:
             raise AgentExecutionError(
@@ -145,6 +179,7 @@ class ChatAgent:
                 "llm_invalid_response",
                 tools=tools,
                 tool_calls=calls,
+                servers=servers,
             ) from exc
         except LLMError as exc:
             raise AgentExecutionError(
@@ -152,24 +187,31 @@ class ChatAgent:
                 "llm_unavailable",
                 tools=tools,
                 tool_calls=calls,
+                servers=servers,
             ) from exc
         except MCPClientError as exc:
+            error_servers = getattr(exc, "servers", None) or self._mcp_registry.servers
             raise AgentExecutionError(
                 str(exc),
                 "mcp_timeout" if isinstance(exc, MCPTimeoutError) else "mcp_unavailable",
                 tools=tools,
                 tool_calls=calls,
+                servers=error_servers,
             ) from exc
 
     async def _execute_tool_call(
         self,
-        mcp_session: ConnectedMCPTools,
+        mcp_session: ConnectedMCPRegistry,
         tool_call: dict[str, Any],
         allowed_tools: dict[str, dict[str, Any]],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         function = tool_call["function"]
-        name = function["name"]
+        llm_tool_name = function["name"]
         call_id = tool_call["id"]
+        route = allowed_tools.get(llm_tool_name)
+        original_name = None if route is None else route.get("original_name", route.get("tool_name"))
+        server_name = None if route is None else route.get("server_name")
+        server_url = None if route is None else route.get("server_url")
         error: str | None = None
         result: dict[str, Any] | None = None
         started = time.monotonic()
@@ -182,28 +224,35 @@ class ChatAgent:
             arguments = {}
             error = "LLM передала некорректные аргументы инструмента."
 
-        if error is None and name not in allowed_tools:
-            error = f"Инструмент «{name}» не предоставлен подключённым MCP-сервером."
+        if error is None and route is None:
+            error = f"Инструмент «{llm_tool_name}» не предоставлен подключёнными MCP-серверами."
 
-        log_event(logger, logging.INFO, "llm_tool_selected", tool_name=name)
+        log_event(logger, logging.INFO, "llm_tool_selected", tool_name=llm_tool_name)
         if error is None:
-            log_event(logger, logging.INFO, "mcp_tool_call_started", tool_name=name)
-            result = await mcp_session.call_tool(name, arguments)
-            if result["is_error"]:
-                error = self._tool_error_text(result)
+            log_event(logger, logging.INFO, "mcp_tool_call_started", tool_name=llm_tool_name)
+            try:
+                result = await mcp_session.call_tool(llm_tool_name, arguments)
+                if result["is_error"]:
+                    error = self._tool_error_text(result)
+            except MCPClientError as exc:
+                error = str(exc)
 
         duration_ms = round((time.monotonic() - started) * 1000)
         log_event(
             logger,
             logging.INFO,
             "mcp_tool_call_finished",
-            tool_name=name,
+            tool_name=llm_tool_name,
             duration_ms=duration_ms,
             outcome="error" if error else "ok",
         )
         record = {
             "id": call_id,
-            "name": name,
+            "name": original_name or llm_tool_name,
+            "server_name": server_name,
+            "server_url": server_url,
+            "tool_name": original_name,
+            "llm_tool_name": llm_tool_name,
             "arguments": arguments,
             "result": result,
             "error": error,

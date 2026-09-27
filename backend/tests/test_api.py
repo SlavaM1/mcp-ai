@@ -1,31 +1,64 @@
 from contextlib import asynccontextmanager
 
-from app.main import app, get_llm_client, get_mcp_client
+from app.main import app, get_llm_client, get_mcp_registry
+from app.mcp_client import MCPConnectionError, MCPRegistry
 
 
-class FakeMCPClient:
-    server_url = "https://mcp.example.test/mcp"
+def raw_tool(name):
+    return {
+        "name": name,
+        "description": name,
+        "input_schema": {"type": "object", "properties": {}},
+    }
 
-    @asynccontextmanager
-    async def connect(self):
-        yield self
+
+class FakeConnectedTools:
+    def __init__(self, server_name, tools, results, calls):
+        self.server_name = server_name
+        self.tools = tools
+        self.results = results
+        self.calls = calls
 
     async def list_tools(self):
-        return [
-            {
-                "name": "ask_question",
-                "description": "Ask about a repository",
-                "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}},
-            }
-        ]
+        return self.tools
 
     async def call_tool(self, name, arguments):
-        assert name == "ask_question"
+        self.calls.append((self.server_name, name, arguments))
+        result = self.results[(self.server_name, name)]
         return {
             "is_error": False,
             "content": [{"type": "text", "text": "ok"}],
-            "structured_content": {"answer": "42"},
+            "structured_content": result,
         }
+
+
+class FakeTransportClient:
+    def __init__(self, name, definition, results, calls):
+        self.name = name
+        self.definition = definition
+        self.results = results
+        self.calls = calls
+
+    @asynccontextmanager
+    async def connect(self):
+        if isinstance(self.definition, Exception):
+            raise self.definition
+        yield FakeConnectedTools(self.name, self.definition, self.results, self.calls)
+
+
+def make_registry(definitions, results=None):
+    calls = []
+    results = results or {}
+
+    def factory(name, _url):
+        return FakeTransportClient(name, definitions[name], results, calls)
+
+    registry = MCPRegistry(
+        {name: f"https://{name}.example.test/mcp" for name in definitions},
+        client_factory=factory,
+    )
+    registry.calls = calls
+    return registry
 
 
 class FakeLLMClient:
@@ -46,41 +79,13 @@ class FakeLLMClient:
                         "id": "call-api-1",
                         "type": "function",
                         "function": {
-                            "name": "ask_question",
+                            "name": "knowledge__ask_question",
                             "arguments": '{"question":"Ответь"}',
                         },
                     }
                 ],
             }
         return {"role": "assistant", "content": "Итоговый ответ: 42.", "tool_calls": []}
-
-
-class MultiToolMCPClient(FakeMCPClient):
-    def __init__(self):
-        self.calls = []
-
-    async def list_tools(self):
-        return [
-            {
-                "name": name,
-                "description": name,
-                "input_schema": {"type": "object", "properties": {}},
-            }
-            for name in ("get_weather_forecast", "analyze_weather", "save_weather_report")
-        ]
-
-    async def call_tool(self, name, arguments):
-        self.calls.append((name, arguments))
-        result = {
-            "get_weather_forecast": {"city": "Moscow", "forecast": [{"date": "2026-09-26"}]},
-            "analyze_weather": {"city": "Moscow", "temperature": {"avg_c": 8}},
-            "save_weather_report": {"saved": True, "file_name": "moscow.md"},
-        }[name]
-        return {
-            "is_error": False,
-            "content": [{"type": "text", "text": "ok"}],
-            "structured_content": result,
-        }
 
 
 class MultiToolLLMClient:
@@ -94,9 +99,9 @@ class MultiToolLLMClient:
 
     async def complete(self, messages, tools):
         calls = [
-            ("get_weather_forecast", {"city": "Москва", "days": 2}),
-            ("analyze_weather", {"weather_data": self.forecast}),
-            ("save_weather_report", {"analysis": self.analysis, "format": "markdown"}),
+            ("weather__get_weather_forecast", {"city": "Москва", "days": 2}),
+            ("analytics__analyze_weather", {"weather_data": self.forecast}),
+            ("storage__save_weather_report", {"analysis": self.analysis, "format": "markdown"}),
         ]
         if self.request_count < len(calls):
             name, arguments = calls[self.request_count]
@@ -135,9 +140,22 @@ def test_agent_message_rejects_whitespace(client):
     assert client.get(f"/api/sessions/{created['id']}").json()["messages"] == []
 
 
-def test_tools_exchange_is_saved_and_returned_in_history(client):
-    app.dependency_overrides[get_mcp_client] = lambda: FakeMCPClient()
+def test_status_and_list_return_partial_registry_catalog(client):
+    registry = make_registry(
+        {
+            "knowledge": [raw_tool("ask_question")],
+            "broken": MCPConnectionError("offline"),
+        }
+    )
+    app.dependency_overrides[get_mcp_registry] = lambda: registry
     try:
+        status = client.get("/api/mcp/status")
+        assert status.status_code == 200
+        assert status.json()["status"] == "partial"
+        assert status.json()["connected"] is True
+        assert status.json()["tool_count"] == 1
+        assert status.json()["servers"][1]["error"] == "offline"
+
         created = client.post("/api/sessions", json={"title": "Новый MCP-чат"}).json()
         response = client.post(
             f"/api/sessions/{created['id']}/tools/list",
@@ -145,23 +163,46 @@ def test_tools_exchange_is_saved_and_returned_in_history(client):
         )
 
         assert response.status_code == 200
-        assert response.json()["tools"][0]["name"] == "ask_question"
-        assert [message["role"] for message in response.json()["session"]["messages"]] == [
-            "user",
-            "assistant",
-        ]
-
-        history = client.get(f"/api/sessions/{created['id']}")
-        assert history.status_code == 200
-        messages = history.json()["messages"]
-        assert messages[0]["content"] == "Покажи инструменты"
-        assert messages[1]["mcp_data"]["tools"][0]["name"] == "ask_question"
+        body = response.json()
+        assert body["status"] == "partial"
+        assert body["tools"][0]["name"] == "knowledge__ask_question"
+        assert body["tools"][0]["original_name"] == "ask_question"
+        messages = body["session"]["messages"]
+        assert [message["role"] for message in messages] == ["user", "assistant"]
+        assert messages[-1]["mcp_data"]["servers"][1]["status"] == "unavailable"
     finally:
         app.dependency_overrides.clear()
 
 
-def test_agent_exchange_and_tool_payload_are_saved(client):
-    app.dependency_overrides[get_mcp_client] = lambda: FakeMCPClient()
+def test_status_returns_unavailable_when_all_servers_are_down(client):
+    registry = make_registry(
+        {
+            "one": MCPConnectionError("one offline"),
+            "two": MCPConnectionError("two offline"),
+        }
+    )
+    app.dependency_overrides[get_mcp_registry] = lambda: registry
+    try:
+        response = client.get("/api/mcp/status")
+
+        assert response.status_code == 200
+        assert response.json()["connected"] is False
+        assert response.json()["status"] == "unavailable"
+        assert response.json()["tool_count"] == 0
+        assert [server["status"] for server in response.json()["servers"]] == [
+            "unavailable",
+            "unavailable",
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_agent_exchange_persists_servers_and_namespaced_route_metadata(client):
+    registry = make_registry(
+        {"knowledge": [raw_tool("ask_question")]},
+        {("knowledge", "ask_question"): {"answer": "42"}},
+    )
+    app.dependency_overrides[get_mcp_registry] = lambda: registry
     app.dependency_overrides[get_llm_client] = lambda: FakeLLMClient()
     try:
         created = client.post("/api/sessions", json={"title": "Агент"}).json()
@@ -171,22 +212,40 @@ def test_agent_exchange_and_tool_payload_are_saved(client):
         )
 
         assert response.status_code == 200
-        messages = response.json()["session"]["messages"]
-        assert messages[-1]["content"] == "Итоговый ответ: 42."
-        call = messages[-1]["mcp_data"]["tool_calls"][0]
+        body = response.json()
+        call = body["session"]["messages"][-1]["mcp_data"]["tool_calls"][0]
         assert call["name"] == "ask_question"
+        assert call["tool_name"] == "ask_question"
+        assert call["llm_tool_name"] == "knowledge__ask_question"
+        assert call["server_name"] == "knowledge"
         assert call["arguments"] == {"question": "Ответь"}
         assert call["result"]["structured_content"] == {"answer": "42"}
+        assert body["servers"][0]["status"] == "ok"
 
         history = client.get(f"/api/sessions/{created['id']}").json()
-        assert history["messages"][-1]["mcp_data"]["tool_calls"][0]["id"] == "call-api-1"
+        saved = history["messages"][-1]["mcp_data"]
+        assert saved["tool_calls"][0]["id"] == "call-api-1"
+        assert saved["servers"][0]["server_name"] == "knowledge"
     finally:
         app.dependency_overrides.clear()
 
 
-def test_multiple_tool_calls_are_saved_in_order_and_old_payload_still_loads(client):
-    mcp = MultiToolMCPClient()
-    app.dependency_overrides[get_mcp_client] = lambda: mcp
+def test_multiple_server_calls_are_saved_in_order_and_old_payload_still_loads(client):
+    forecast = {"city": "Moscow", "forecast": [{"date": "2026-09-26"}]}
+    analysis = {"city": "Moscow", "temperature": {"avg_c": 8}}
+    registry = make_registry(
+        {
+            "weather": [raw_tool("get_weather_forecast")],
+            "analytics": [raw_tool("analyze_weather")],
+            "storage": [raw_tool("save_weather_report")],
+        },
+        {
+            ("weather", "get_weather_forecast"): forecast,
+            ("analytics", "analyze_weather"): analysis,
+            ("storage", "save_weather_report"): {"saved": True, "file_name": "moscow.md"},
+        },
+    )
+    app.dependency_overrides[get_mcp_registry] = lambda: registry
     app.dependency_overrides[get_llm_client] = lambda: MultiToolLLMClient()
     try:
         created = client.post("/api/sessions", json={"title": "Композиция"}).json()
@@ -197,20 +256,14 @@ def test_multiple_tool_calls_are_saved_in_order_and_old_payload_still_loads(clie
 
         assert response.status_code == 200
         tool_calls = response.json()["session"]["messages"][-1]["mcp_data"]["tool_calls"]
-        assert [call["name"] for call in tool_calls] == [
-            "get_weather_forecast",
-            "analyze_weather",
-            "save_weather_report",
+        assert [call["llm_tool_name"] for call in tool_calls] == [
+            "weather__get_weather_forecast",
+            "analytics__analyze_weather",
+            "storage__save_weather_report",
         ]
         assert [call["sequence"] for call in tool_calls] == [1, 2, 3]
-        assert mcp.calls[1][1]["weather_data"] == {
-            "city": "Moscow",
-            "forecast": [{"date": "2026-09-26"}],
-        }
-        assert mcp.calls[2][1]["analysis"] == {
-            "city": "Moscow",
-            "temperature": {"avg_c": 8},
-        }
+        assert registry.calls[1][2]["weather_data"] == forecast
+        assert registry.calls[2][2]["analysis"] == analysis
 
         history = client.get(f"/api/sessions/{created['id']}").json()
         assert len(history["messages"][-1]["mcp_data"]["tool_calls"]) == 3

@@ -45,25 +45,43 @@ class AgentMessageRequest(BaseModel):
 
 class ToolDefinition(BaseModel):
     name: str
+    llm_tool_name: str | None = None
+    original_name: str | None = None
+    tool_name: str | None = None
+    server_name: str | None = None
+    server_url: str | None = None
     description: str | None = None
     input_schema: dict[str, Any] | None = None
+
+
+class MCPServerStatus(BaseModel):
+    server_name: str
+    server_url: str
+    status: Literal["ok", "unavailable"]
+    tool_count: int = 0
+    error: str | None = None
 
 
 class ToolListResponse(BaseModel):
     session: SessionRead
     tools: list[ToolDefinition]
-    server_url: str
+    server_url: str | None
     connected: bool
+    status: Literal["ok", "partial", "unavailable"]
+    servers: list[MCPServerStatus]
 
 
 class MCPStatus(BaseModel):
     connected: bool
-    server_url: str
-    tool_count: int | None = None
+    status: Literal["ok", "partial", "unavailable"]
+    server_url: str | None
+    tool_count: int = 0
+    servers: list[MCPServerStatus]
     error: str | None = None
 
 
 class AgentMessageResponse(BaseModel):
     session: SessionRead
-    server_url: str
+    server_url: str | None
+    servers: list[MCPServerStatus]
     tool_calls: list[dict[str, Any]]
